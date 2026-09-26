@@ -1,0 +1,31 @@
+# build artifacts
+target/
+build/
+dist/
+*.so
+*.dylib
+*.pyd
+*.dll
+*.whl
+*.zip
+*.tmp
+
+# outputs (tracks written by tests/examples)
+*.m4a
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# editor / os
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

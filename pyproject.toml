@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "decryptune"
+description = "Fast native M4A/fMP4 CENC decryptor, MP4 sanitizer and iTunes tagger, sync & async Python"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Arsham", email = "su@arsham.app" }]
+requires-python = ">=3.12"
+keywords = ["mp4", "m4a", "cenc", "decrypt", "metadata", "async"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio"
+]
+dynamic = ["version"] # single source of truth: Cargo.toml
+
+[project.urls]
+Repository = "https://github.com/arsham6ix/decryptune"
+
+[tool.maturin]
+python-source = "python"
