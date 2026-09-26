@@ -1,0 +1,215 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "build everything, do not touch the release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags needed for the release check
+      - id: decide
+        name: release when Cargo.toml version has no tag yet
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "manual dispatch — force release v$V"
+          elif git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "tag v$V already exists — nothing to release"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "new version v$V — full build + release"
+          fi
+
+  # standalone zips: the raw cdylib is extracted from the manylinux wheel
+  # (guarantees glibc 2.28 compat AND byte-identical binary with the wheel)
+  build-linux:
+    needs: verify
+    if: needs.verify.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out wheelhouse
+          manylinux: "2_28"
+      - name: package binary + wrapper
+        run: |
+          python3 -m zipfile -e wheelhouse/decryptune-*.whl extracted/
+          mkdir -p dist
+          cp extracted/decryptune/decryptune.*.so dist/libdecryptune.so
+          cp decryptune.py dist/
+          cd dist
+          python3 -m zipfile -c "decryptune-${{ matrix.platform }}.zip" libdecryptune.so decryptune.py
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: bin-${{ matrix.platform }}
+          path: dist/*.zip
+
+  # Windows zips: raw cargo build (the MSVC link has no undefined-symbol issue)
+  build-native:
+    needs: verify
+    if: needs.verify.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            artifact: decryptune.dll
+            rename: decryptune.pyd
+            platform: windows-x86_64
+          - runner: windows-11-arm
+            artifact: decryptune.dll
+            rename: decryptune.pyd
+            platform: windows-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: package binary + wrapper
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.artifact }}" "dist/${{ matrix.rename || matrix.artifact }}"
+          cp decryptune.py dist/
+          cd dist
+          python -m zipfile -c "decryptune-${{ matrix.platform }}.zip" "${{ matrix.rename || matrix.artifact }}" "decryptune.py"
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: bin-${{ matrix.platform }}
+          path: dist/*.zip
+
+  # abi3 wheels: linux + windows (manylinux_2_28 for the widest glibc coverage)
+  wheels:
+    needs: verify
+    if: needs.verify.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            manylinux: "2_28"
+            name: wheels-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            manylinux: "2_28"
+            name: wheels-linux-aarch64
+          - runner: windows-latest
+            name: wheels-windows-x86_64
+          - runner: windows-11-arm
+            name: wheels-windows-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: ${{ matrix.name }}
+          path: dist/*.whl
+
+  # source distribution for the release (synapse-style completeness)
+  sdist:
+    needs: verify
+    if: needs.verify.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: sdist
+          path: dist/*.tar.gz
+
+  release:
+    needs: [verify, build-linux, build-native, wheels, sdist]
+    if: ${{ !failure() && !cancelled() && needs.verify.outputs.release == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: rel
+          merge-multiple: true
+      - name: create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run — release v$VERSION NOT touched, would attach:"
+            ls -l rel
+            exit 0
+          fi
+          # no checkout in this job — pass the repo explicitly to gh
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber rel/*
+          else
+            gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --title "decryptune v$VERSION" --notes "decryptune v$VERSION — wheels + standalone binaries" rel/*
+          fi
+
+  # PyPI: needs a Trusted Publisher configured on pypi.org
+  # (project decryptune, owner arsham6ix, workflow build.yml, environment pypi)
+  publish:
+    needs: [verify, release]
+    if: ${{ !failure() && !cancelled() && needs.verify.outputs.release == 'true' && inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # OIDC trusted publishing — no token stored
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          pattern: wheels-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          pattern: sdist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: all
