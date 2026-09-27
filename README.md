@@ -50,7 +50,7 @@ Rules that hold for both `proc` and `aproc`:
 
 ## Benchmark
 
-Real 3.0MB fragmented track, Intel i7-11800H (8C/16T), WSL2, v1.0.0:
+Real 3.0MB fragmented track, Intel i7-11800H (8C/16T), WSL2, v1.1.0:
 
 | scenario | result |
 |---|---|

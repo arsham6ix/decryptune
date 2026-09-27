@@ -16,7 +16,7 @@ from importlib.machinery import ModuleSpec
 from importlib.util import module_from_spec, spec_from_file_location
 from types import ModuleType
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
 
 
