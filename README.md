@@ -10,7 +10,7 @@ pip install decryptune
 
 **Standalone (no install)** — keep `decryptune.py` next to the extension binary and pass its path: `DecrypTune("./libdecryptune.so")`
 
-From source (needs Rust 1.85+ and Python 3.12+): `pip install maturin && maturin build --release`
+From source (needs Rust 1.85+ and Python 3.12+): `pip install maturin && maturin build --release` — this is also the macOS path (it builds and runs the same; prebuilt wheels and zips ship for Linux and Windows).
 
 ## Usage
 
@@ -47,6 +47,18 @@ Rules that hold for both `proc` and `aproc`:
 - `key=None` → **fix-only pass**: headers sanitized, audio payload untouched.
 - A `meta` **wipes** the existing tag block and rebuilds it solely from the given fields — `None` / `0` / empty values are skipped; without `meta` the original metadata passes through untouched.
 - Any problem raises `DecrypTuneError` with a stable numeric code (1–13) and a message authored in the native core: `1` invalid key · `2` invalid kid · `3` input not found · `4` not an MP4 · `6` write failed · `7` KID mismatch · `8` corrupt audio detected · `9` bad input type · `10` bad out type · `11` tags need a fragmented file · `12` bad cover · `13` cover file not found.
+
+## Benchmark
+
+Real 3.0MB fragmented track, Intel i7-11800H (8C/16T), WSL2, v1.0.0:
+
+| scenario | result |
+|---|---|
+| decrypt + fix, strict (bytes in/out) | 3.7 ms median — ~0.8 GB/s |
+| fix-only pass (no key) | 1.7 ms |
+| full tags + cover resize (877KB JPEG) | 101 ms |
+| 32 calls: sequential → `asyncio.gather` | 74 ms → 29 ms (**×2.5**) |
+| event-loop max lag under 8 concurrent heavy calls | < 4 ms |
 
 ## License
 
