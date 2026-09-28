@@ -112,12 +112,6 @@ fn build_items(meta: &CoreMeta) -> Result<Vec<u8>, Err> {
     Ok(out)
 }
 
-// metadata is written from scratch: any pre-existing ilst is wiped and
-// rebuilt solely from the caller's TuneMeta (deterministic, no merging)
-fn fresh_ilst(meta: &CoreMeta) -> Result<Vec<u8>, Err> {
-    build_items(meta)
-}
-
 fn meta_box(ilst: &[u8]) -> Vec<u8> {
     // hdlr in full ISO form (with pre_defined) — the Windows handler bails on short ones
     let mut hdlr: Vec<u8> = Vec::new();
@@ -140,15 +134,17 @@ fn meta_box(ilst: &[u8]) -> Vec<u8> {
     out
 }
 
-// rebuild moov so a freshly built udta/meta/ilst is the first child; any
-// pre-existing udta (with its ilst) is removed entirely
+// metadata is written from scratch: any pre-existing ilst is wiped and rebuilt
+// solely from the caller's TuneMeta (deterministic, no merging); the fresh
+// udta/meta/ilst subtree goes first in moov — any pre-existing udta (with its
+// ilst) is removed entirely
 pub(crate) fn rebuild_moov_with_meta(children: &[u8], meta: &CoreMeta) -> Result<Vec<u8>, Err> {
     // every old udta goes — keeping any would both leak stale tags and shadow the
     // fresh subtree for the Windows handler (it reads only the first udta/meta)
     let udta: Vec<(usize, usize)> = parse(children, 0, children.len())
         .iter().filter(|c| c.is(b"udta")).map(|c| (c.start, c.end)).collect();
 
-    let new_meta: Vec<u8> = meta_box(&fresh_ilst(meta)?);
+    let new_meta: Vec<u8> = meta_box(&build_items(meta)?);
 
     // udta goes first in moov — the Windows MP4 handler reads only the first udta/meta subtree
     let mut out: Vec<u8> = Vec::with_capacity(children.len() + new_meta.len());

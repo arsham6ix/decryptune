@@ -107,25 +107,45 @@ fn write_atomic(out_path: &str, data: &[u8]) -> Result<(), Err> {
     std::fs::rename(&tmp, out_path).map_err(|_| Err::WriteFailed)
 }
 
-fn parse_input(value: &Bound<'_, PyAny>) -> PyResult<Input> {
+// the shared bytes/path dispatch: bytes | bytearray | str path | __fspath__ | memoryview
+enum Extracted {
+    Bytes(Vec<u8>),
+    Path(String)
+}
+
+fn extract_bytes_or_path(value: &Bound<'_, PyAny>, bad: Err) -> PyResult<Extracted> {
     Ok(if let Ok(b) = value.cast::<PyBytes>() {
-        Input::Bytes(b.as_bytes().to_vec())
+        Extracted::Bytes(b.as_bytes().to_vec())
     } else if let Ok(b) = value.cast::<PyByteArray>() {
-        Input::Bytes(b.to_vec())
+        Extracted::Bytes(b.to_vec())
     } else if let Ok(s) = value.cast::<PyString>() {
-        Input::Path(s.to_str()?.to_string())
+        Extracted::Path(s.to_str()?.to_string())
     } else if let Ok(p) = value.call_method0("__fspath__") { // os.PathLike
-        Input::Path(p.cast::<PyString>()?.to_str()?.to_string())
+        // fspath may legally return bytes — map that here, never a raw downcast error
+        Extracted::Path(if let Ok(s) = p.cast::<PyString>() {
+            s.to_str()?.to_string()
+        } else if let Ok(b) = p.cast::<PyBytes>() {
+            String::from_utf8_lossy(b.as_bytes()).into_owned()
+        } else {
+            return Err(bad.into());
+        })
     } else {
         // exotic buffer (memoryview, …) — abi3 has no PyBuffer; memoryview()
         // accepts only real buffer objects (bytes(123) would mean 123 zero bytes!)
         match value.py().import("builtins")?.getattr("memoryview")?.call1((value,)) {
             Ok(mv) => {
                 let b = mv.call_method0("tobytes")?;
-                Input::Bytes(b.cast::<PyBytes>()?.as_bytes().to_vec())
+                Extracted::Bytes(b.cast::<PyBytes>()?.as_bytes().to_vec())
             }
-            Err(_) => return Err(Err::BadInput.into())
+            Err(_) => return Err(bad.into()),
         }
+    })
+}
+
+fn parse_input(value: &Bound<'_, PyAny>) -> PyResult<Input> {
+    Ok(match extract_bytes_or_path(value, Err::BadInput)? {
+        Extracted::Bytes(b) => Input::Bytes(b),
+        Extracted::Path(p)  => Input::Path(p)
     })
 }
 
@@ -133,11 +153,17 @@ fn parse_output(out: Option<&Bound<'_, PyAny>>) -> PyResult<Output> {
     match out {
         None => Ok(Output::Return),
         Some(v) => {
-            // same path handling as input — os.PathLike accepted too
             let path: String = if let Ok(s) = v.cast::<PyString>() {
                 s.to_str()?.to_string()
-            } else if let Ok(p) = v.call_method0("__fspath__") {
-                p.cast::<PyString>()?.to_str()?.to_string()
+            } else if let Ok(p) = v.call_method0("__fspath__") { // os.PathLike
+                // same fspath-bytes rule as input — a coded error, not a raw downcast
+                if let Ok(s) = p.cast::<PyString>() {
+                    s.to_str()?.to_string()
+                } else if let Ok(b) = p.cast::<PyBytes>() {
+                    String::from_utf8_lossy(b.as_bytes()).into_owned()
+                } else {
+                    return Err(Err::BadOutput.into());
+                }
             } else {
                 return Err(Err::BadOutput.into());
             };
@@ -246,22 +272,10 @@ fn resolve_meta(py: Python<'_>, meta: Option<&TuneMeta>) -> PyResult<Option<meta
     let Some(m) = meta else { return Ok(None) };
     let cover: Option<meta::RawCover> = match &m.cover {
         None      => None,
-        Some(obj) => {
-            let bound = obj.bind(py);
-            Some(if let Ok(b) = bound.cast::<PyBytes>() { meta::RawCover::Bytes(b.as_bytes().to_vec()) }
-                else if let Ok(b) = bound.cast::<PyByteArray>() { meta::RawCover::Bytes(b.to_vec()) }
-                else if let Ok(s) = bound.cast::<PyString>() { meta::RawCover::Path(s.to_str()?.to_string()) }
-                else if let Ok(p) = bound.call_method0("__fspath__") { meta::RawCover::Path(p.cast::<PyString>()?.to_str()?.to_string()) }
-                else {
-                    match py.import("builtins")?.getattr("memoryview")?.call1((bound,)) {
-                        Ok(mv) => {
-                            let b = mv.call_method0("tobytes")?;
-                            meta::RawCover::Bytes(b.cast::<PyBytes>()?.as_bytes().to_vec())
-                        }
-                        Err(_) => return Err(Err::BadCover.into())
-                    }
-                })
-        }
+        Some(obj) => Some(match extract_bytes_or_path(obj.bind(py), Err::BadCover)? {
+            Extracted::Bytes(b) => meta::RawCover::Bytes(b),
+            Extracted::Path(p)  => meta::RawCover::Path(p)
+        })
     };
     let non_zero: fn(Option<u32>) -> Option<u32> = |v| v.filter(|n| *n > 0);
     let non_empty: fn(&Option<String>) -> Option<String> = |v| v.clone().filter(|s| !s.is_empty());

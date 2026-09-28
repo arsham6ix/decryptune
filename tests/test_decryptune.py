@@ -416,6 +416,22 @@ def test_path_out_pathlib(sp, src_file, tmp_path):
     assert dst.read_bytes() == sp.proc(input=src_file, key=KEY_HEX)
 
 
+class _BytesPath:
+    """os.fspath objects may legally return bytes — must behave like a str path."""
+
+    def __init__(self, p):
+        self.p = str(p)
+
+    def __fspath__(self):
+        return os.fsencode(self.p)
+
+
+def test_fspath_bytes_input_and_out(sp, src_file, tmp_path):
+    dst = tmp_path / "out_fspath.m4a"
+    assert sp.proc(input=_BytesPath(src_file), out=_BytesPath(dst), key=KEY_HEX) is None
+    assert dst.read_bytes() == sp.proc(input=src_file, key=KEY_HEX)
+
+
 def test_error_tags_need_fragmented(sp):
     # a non-empty stco dangles once moov grows with tags -> refused
     stco = full_box(b"stco", 0, 0, u32(1) + u32(100))

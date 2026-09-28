@@ -203,7 +203,7 @@ fn has_chunk_offsets(children: &[u8], depth: usize) -> bool {
                 && u32::from_be_bytes(children[child.content_start + 4..child.content_start + 8].try_into().unwrap()) > 0 => return true,
             b"co64" if child.end - child.content_start >= 12
                 && u64::from_be_bytes(children[child.content_start + 4..child.content_start + 12].try_into().unwrap()) > 0 => return true,
-            typ if matches!(typ, b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl")
+            typ if CONTAINERS.contains(&typ)
                 && has_chunk_offsets(&children[child.content_start..child.end], depth + 1) => return true,
             _ => {}
         }
