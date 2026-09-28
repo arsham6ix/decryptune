@@ -100,11 +100,16 @@ fn tmp_path(out_path: &str) -> String {
     format!("{}.{}.{}.tmp", out_path, std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
-// write to <out>.<n>.tmp then rename — no partial outputs on crash
+// write to <out>.<n>.tmp then rename — no partial outputs on crash;
+// a failed rename removes the tmp file (no litter in the output directory)
 fn write_atomic(out_path: &str, data: &[u8]) -> Result<(), Err> {
     let tmp: String = tmp_path(out_path);
     std::fs::write(&tmp, data).map_err(|_| Err::WriteFailed)?;
-    std::fs::rename(&tmp, out_path).map_err(|_| Err::WriteFailed)
+    if std::fs::rename(&tmp, out_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Err::WriteFailed);
+    }
+    Ok(())
 }
 
 // the shared bytes/path dispatch: bytes | bytearray | str path | __fspath__ | memoryview
@@ -360,7 +365,10 @@ fn aproc<'py>(
             Output::Path(p) => {
                 let tmp: String = tmp_path(&p);
                 tokio::fs::write(&tmp, &processed.data).await.map_err(|_| Err::WriteFailed)?;
-                tokio::fs::rename(&tmp, &p).await.map_err(|_| Err::WriteFailed)?;
+                if tokio::fs::rename(&tmp, &p).await.is_err() {
+                    let _ = tokio::fs::remove_file(&tmp).await; // no tmp litter on a failed rename
+                    return Err(Err::WriteFailed.into());
+                }
                 Ok(None)
             }
             Output::Return  => Ok(Some(processed.data))

@@ -432,6 +432,25 @@ def test_fspath_bytes_input_and_out(sp, src_file, tmp_path):
     assert dst.read_bytes() == sp.proc(input=src_file, key=KEY_HEX)
 
 
+def test_out_is_directory_no_tmp_litter(sp, src_file, tmp_path):
+    # rename onto an existing directory fails — the tmp file must not be left behind
+    out_dir = tmp_path / "outdir"
+    out_dir.mkdir()
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=src_file, out=str(out_dir), key=KEY_HEX)
+    assert e.value.code == 6
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_aproc_out_is_directory_no_tmp_litter(sp, src_file, tmp_path):
+    out_dir = tmp_path / "aoutdir"
+    out_dir.mkdir()
+    with pytest.raises(DecrypTuneError) as e:
+        asyncio.run(sp.aproc(input=src_file, out=str(out_dir), key=KEY_HEX))
+    assert e.value.code == 6
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_error_tags_need_fragmented(sp):
     # a non-empty stco dangles once moov grows with tags -> refused
     stco = full_box(b"stco", 0, 0, u32(1) + u32(100))
