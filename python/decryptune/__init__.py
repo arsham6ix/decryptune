@@ -8,7 +8,7 @@ tree. Keep this file in sync with it (same API surface, loader differs).
 
 from . import decryptune as _native
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
 
 
