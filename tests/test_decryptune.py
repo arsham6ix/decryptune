@@ -532,6 +532,60 @@ def test_hostile_truncated_sidx(sp, version, content_len):
     assert isinstance(sp.proc(input=hostile), bytes)
 
 
+def test_mdat_largesize_preserved(sp, sample):
+    # a 64-bit (largesize) mdat must keep its 64-bit header — a u32 rewrite wraps
+    data, expected = sample
+    m = find(data, b"mdat")[0]
+    content = data[m[1] + 8:m[1] + m[2]]
+    large = data[:m[1]] + u32(1) + b"mdat" + struct.pack(">Q", len(content) + 16) + content + data[m[1] + m[2]:]
+    out = sp.proc(input=large, key=KEY_HEX)
+    pos = out.find(b"mdat")            # type word; size field sits right before it
+    (size_field,) = struct.unpack_from(">I", out, pos - 4)
+    (size64,) = struct.unpack_from(">Q", out, pos + 4)
+    assert size_field == 1 and size64 == len(content) + 16
+    assert out[pos + 12:pos - 4 + size64] == b"".join(expected[1])
+
+
+def test_senc_bounded_to_box(sp):
+    # senc declares 2 IVs but its box ends before them — the parser must not
+    # borrow bytes from the following mdat (would decrypt with garbage IVs
+    # and falsely fail strict); instead the fragment counts as partially plain
+    enc = ctr_crypt(KEY, bytes(8), bytes([0x5A]) * 40000)
+    moof = make_moof(1, [make_tfhd(), make_trun([20000, 20000], 0),
+                         full_box(b"senc", 0, 0, u32(2))])
+    hostile = box(b"ftyp", b"M4A isom") + moof + box(b"mdat", enc) + make_moov()
+    out = sp.proc(input=hostile, key=KEY_HEX, strict=True)   # must NOT raise code 8
+    m = find(out, b"mdat")[0]
+    assert out[m[1] + 8:m[1] + m[2]] == enc   # untouched passthrough
+
+
+def test_tfhd_truncated_no_readthrough(sp):
+    # tfhd claims the default-size flag but its box ends first — no panic,
+    # a coded outcome only (samples fall back to size 0 → undecrypted pass)
+    tfhd = full_box(b"tfhd", 0, 0x10, u32(1))
+    moof = make_moof(1, [tfhd, make_trun([100] * 4, 0, with_sizes=False),
+                         make_senc([bytes(8)] * 4)])
+    hostile = box(b"ftyp", b"M4A isom") + moof + box(b"mdat", bytes(400))
+    try:
+        assert isinstance(sp.proc(input=hostile, key=KEY_HEX, strict=True), bytes)
+    except DecrypTuneError as e:
+        assert e.code in (4, 8)
+
+
+def test_aproc_cancel_no_tmp_litter(sp, src_file, tmp_path):
+    # futures cancelled anywhere in the write path must never leave *.tmp behind
+    async def main():
+        tasks = [asyncio.create_task(sp.aproc(input=src_file, out=str(tmp_path / f"c{i}.m4a"), key=KEY_HEX))
+                 for i in range(64)]
+        await asyncio.sleep(0.002)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(main())
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 # ---- metadata ---------------------------------------------------------------
 
 def test_udta_first(sp, tagged):

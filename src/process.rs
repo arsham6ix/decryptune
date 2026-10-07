@@ -114,10 +114,10 @@ fn visit_moof(out: &mut Vec<u8>, data: &[u8], b: &Box) -> Plan {
 
         // gather: tfhd default first so trun fallback works in any order
         default_size = traf.iter().find(|t| t.is(b"tfhd"))
-            .and_then(|t| parse_tfhd(data, t.content_start));
+            .and_then(|t| parse_tfhd(data, t.content_start, t.end));
         for t in &traf {
             match &t.typ {
-                b"senc" if ivs.is_none() => ivs = parse_senc(data, t.content_start),
+                b"senc" if ivs.is_none() => ivs = parse_senc(data, t.content_start, t.end),
                 b"trun"                  => sizes.extend(parse_trun_sizes(data, t.content_start, t.end, default_size)),
                 _                        => {}
             }
@@ -169,7 +169,15 @@ fn emit_mdat(
     plan   : &Plan,
     strict : bool
 ) -> FragmentStat {
-    write_header(out, b"mdat", m.end - m.content_start);
+    // a largesize (64-bit) mdat keeps its 64-bit header — a u32 rewrite would wrap
+    let content_len: usize = m.end - m.content_start;
+    if content_len + 8 > u32::MAX as usize || u32::from_be_bytes(data[m.start..m.start + 4].try_into().unwrap()) == 1 {
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(b"mdat");
+        out.extend_from_slice(&((content_len as u64) + 16).to_be_bytes());
+    } else {
+        write_header(out, b"mdat", content_len);
+    }
     let base: usize = out.len();
     out.extend_from_slice(&data[m.content_start..m.end]);
     let encrypted: bool = plan.ok;
@@ -211,34 +219,35 @@ fn has_chunk_offsets(children: &[u8], depth: usize) -> bool {
     false
 }
 
-// default_sample_size from tfhd (flag 0x10), honoring preceding optional fields
-fn parse_tfhd(data: &[u8], start: usize) -> Option<u32> {
-    if start + 8 > data.len() { return None; }
+// default_sample_size from tfhd (flag 0x10), honoring preceding optional fields;
+// every read stays inside the tfhd box — never spills into a sibling box
+fn parse_tfhd(data: &[u8], start: usize, end: usize) -> Option<u32> {
+    if start + 8 > end { return None; }
     let flags: u32 = u32::from_be_bytes(data[start..start + 4].try_into().ok()?) & 0xFFFFFF;
     let mut pos: usize = start + 8; // version/flags + track_ID
     if flags & 0x1 != 0 { pos += 8; }  // base_data_offset
     if flags & 0x2 != 0 { pos += 4; }  // sample_description_index
     if flags & 0x8 != 0 { pos += 4; }  // default_sample_duration
-    if flags & 0x10 == 0 || pos + 4 > data.len() { return None; }
+    if flags & 0x10 == 0 || pos + 4 > end { return None; }
     Some(u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?))
 }
 
 // IVs from senc; subsample entries (flag 0x2) are parsed over for IV alignment,
-// not applied — samples are fully encrypted
-fn parse_senc(data: &[u8], start: usize) -> Option<Vec<[u8; 16]>> {
-    if start + 8 > data.len() { return None; }
+// not applied — samples are fully encrypted; bounded by the box end, not the file
+fn parse_senc(data: &[u8], start: usize, end: usize) -> Option<Vec<[u8; 16]>> {
+    if start + 8 > end { return None; }
     let flags: u32 = u32::from_be_bytes(data[start..start + 4].try_into().ok()?) & 0xFFFFFF;
     let count: usize = u32::from_be_bytes(data[start + 4..start + 8].try_into().ok()?) as usize;
-    if count > (data.len() - start - 8) / 8 { return None; } // hostile count bound
+    if count > (end - start - 8) / 8 { return None; } // hostile count bound
     let mut pos: usize = start + 8;
     let mut ivs: Vec<[u8; 16]> = Vec::with_capacity(count);
     for _ in 0..count {
-        if pos + 8 > data.len() { return None; }
+        if pos + 8 > end { return None; }
         let mut iv: [u8; 16] = [0u8; 16];
         iv[..8].copy_from_slice(&data[pos..pos + 8]);
         pos += 8;
         if flags & 0x2 != 0 {
-            if pos + 2 > data.len() { return None; }
+            if pos + 2 > end { return None; }
             let sub: usize = u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
             pos += 2 + sub * 6;
         }

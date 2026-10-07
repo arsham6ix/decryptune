@@ -330,6 +330,15 @@ fn proc<'py>(
     Ok(result.map(|bytes| PyBytes::new(py, &bytes).into_any()))
 }
 
+// a worker panic must surface with its real message, not a fake error
+fn join_err(join: tokio::task::JoinError) -> PyErr {
+    let msg: String = join.try_into_panic().ok()
+        .and_then(|p| p.downcast_ref::<&str>().map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned()))
+        .unwrap_or_else(|| "internal worker panic".into());
+    PyException::new_err(msg)
+}
+
 // async twin of proc: native coroutine, CPU work off-GIL, async file writes
 #[pyfunction]
 #[pyo3(signature = (*, input, out=None, key=None, kid=None, meta=None, strict=false))]
@@ -351,24 +360,16 @@ fn aproc<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let processed: process::Processed = tokio::task::spawn_blocking(move || run(input, key, kid, core_meta, strict))
             .await
-            .map_err(|join| {
-                // a worker panic must surface with its real message, not a fake write error
-                let msg = join.try_into_panic().ok()
-                    .and_then(|p| p.downcast_ref::<&str>().map(|s| s.to_string())
-                        .or_else(|| p.downcast_ref::<String>().cloned()))
-                    .unwrap_or_else(|| "internal worker panic".into());
-                PyException::new_err(msg)
-            })??;
+            .map_err(join_err)??;
         check_strict(&processed, key, strict)?;
         match output {
-            // true async write — std::fs here would block a runtime worker
+            // write+rename run as ONE blocking task — a cancelled future cannot
+            // split the pair and leave a tmp behind (tokio::fs is spawn_blocking
+            // under the hood anyway, so this frees the worker just as well)
             Output::Path(p) => {
-                let tmp: String = tmp_path(&p);
-                tokio::fs::write(&tmp, &processed.data).await.map_err(|_| Err::WriteFailed)?;
-                if tokio::fs::rename(&tmp, &p).await.is_err() {
-                    let _ = tokio::fs::remove_file(&tmp).await; // no tmp litter on a failed rename
-                    return Err(Err::WriteFailed.into());
-                }
+                tokio::task::spawn_blocking(move || write_atomic(&p, &processed.data))
+                    .await
+                    .map_err(join_err)??;
                 Ok(None)
             }
             Output::Return  => Ok(Some(processed.data))
