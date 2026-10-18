@@ -1,94 +1,19 @@
 mod boxes;
 mod cover;
+mod error;
+mod input;
 mod jpeg;
 mod meta;
 mod process;
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyException;
-use pyo3::types::{PyByteArray, PyBytes, PyString};
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-enum Input {
-    Owned(Vec<u8>),
-    // PyBytes is immutable, so borrowing its buffer across a GIL release is
-    // sound: the Py<> owner pins the object alive and nothing can change it
-    // (the owner field is intentionally never read — it only anchors the slice)
-    Borrowed(#[allow(dead_code)] Py<PyBytes>, &'static [u8]),
-    Path(String)
-}
-
-enum InputData {
-    // the owner is never read — it only anchors the borrowed slice
-    Owned(Vec<u8>),
-    Borrowed(#[allow(dead_code)] Py<PyBytes>, &'static [u8])
-}
-
-impl InputData {
-    fn bytes(&self) -> &[u8] {
-        match self { InputData::Owned(v) => v, InputData::Borrowed(_, s) => s }
-    }
-}
-
-impl Input {
-    fn load(self) -> Result<InputData, Err> {
-        Ok(match self {
-            Input::Owned(v)       => InputData::Owned(v),
-            Input::Borrowed(o, s) => InputData::Borrowed(o, s),
-            Input::Path(p)        => InputData::Owned(std::fs::read(&p).map_err(|_| Err::InputNotFound)?)
-        })
-    }
-}
-
-enum Output {
-    Path(String),
-    Return
-}
-
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // DecryptFailed is part of the stable error-code contract
-enum Err {
-    InvalidKey          = 1,
-    InvalidKid          = 2,
-    InputNotFound       = 3,
-    InvalidMp4          = 4,
-    DecryptFailed       = 5,
-    WriteFailed         = 6,
-    KidMismatch         = 7,
-    CorruptDetected     = 8,
-    BadInput            = 9,
-    BadOutput           = 10,
-    MetaNeedsFragmented = 11,
-    BadCover            = 12,
-    CoverNotFound       = 13 // additive: a missing cover path must not read as a missing input
-}
-
-impl Err {
-    fn msg(self) -> &'static str {
-        match self {
-            Err::InvalidKey          => "invalid key: must be 32 hex characters",
-            Err::InvalidKid          => "invalid kid: must be 32 hex characters",
-            Err::InputNotFound       => "input file not found",
-            Err::CoverNotFound       => "cover file not found",
-            Err::InvalidMp4          => "input is not a valid MP4",
-            Err::DecryptFailed       => "decrypt failed: corrupt or unsupported fragment",
-            Err::WriteFailed         => "failed to write output file",
-            Err::KidMismatch         => "key does not match this file (KID mismatch)",
-            Err::CorruptDetected     => "decrypted audio is corrupt (wrong or fake key)",
-            Err::BadInput            => "invalid input: expected bytes, bytearray, memoryview, or a path",
-            Err::BadOutput           => "invalid out: expected a path or None",
-            Err::MetaNeedsFragmented => "metadata write requires a fragmented file (non-empty chunk offsets)",
-            Err::BadCover            => "unsupported cover format: expected JPEG or PNG"
-        }
-    }
-}
-
-impl From<Err> for PyErr {
-    fn from(e: Err) -> PyErr {
-        PyException::new_err(format!("[{}] {}", e as i32, e.msg()))
-    }
-}
+use error::Err;
+use input::{parse_input, parse_output, InputData, Output};
 
 fn parse_hex16(hex: &str) -> Result<[u8; 16], Err> {
     let hex: &str = hex.trim();
@@ -130,82 +55,10 @@ fn write_atomic(out_path: &str, data: &[u8]) -> Result<(), Err> {
     Ok(())
 }
 
-// the shared bytes/path dispatch: bytes | bytearray | str path | __fspath__ | memoryview
-enum Extracted {
-    Bytes(Vec<u8>),
-    Borrowed(Py<PyBytes>, &'static [u8]),
-    Path(String)
-}
-
-fn extract_bytes_or_path(value: &Bound<'_, PyAny>, bad: Err) -> PyResult<Extracted> {
-    Ok(if let Ok(b) = value.cast::<PyBytes>() {
-        // immutable bytes — pin the object and borrow its buffer instead of
-        // copying; from_raw_parts re-lifetimes the slice, sound because the
-        // Py<> owner stored beside it outlives every use of the slice
-        let owner: Py<PyBytes> = b.clone().unbind();
-        let s: &[u8] = b.as_bytes();
-        Extracted::Borrowed(owner, unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len()) })
-    } else if let Ok(b) = value.cast::<PyByteArray>() {
-        Extracted::Bytes(b.to_vec()) // mutable — a copy is mandatory
-    } else if let Ok(s) = value.cast::<PyString>() {
-        Extracted::Path(s.to_str()?.to_string())
-    } else if let Ok(p) = value.call_method0("__fspath__") { // os.PathLike
-        // fspath may legally return bytes — map that here, never a raw downcast error
-        Extracted::Path(if let Ok(s) = p.cast::<PyString>() {
-            s.to_str()?.to_string()
-        } else if let Ok(b) = p.cast::<PyBytes>() {
-            String::from_utf8_lossy(b.as_bytes()).into_owned()
-        } else {
-            return Err(bad.into());
-        })
-    } else {
-        // exotic buffer (memoryview, …) — abi3 has no PyBuffer; memoryview()
-        // accepts only real buffer objects (bytes(123) would mean 123 zero bytes!)
-        match value.py().import("builtins")?.getattr("memoryview")?.call1((value,)) {
-            Ok(mv) => {
-                let b = mv.call_method0("tobytes")?;
-                Extracted::Bytes(b.cast::<PyBytes>()?.as_bytes().to_vec())
-            }
-            Err(_) => return Err(bad.into()),
-        }
-    })
-}
-
-fn parse_input(value: &Bound<'_, PyAny>) -> PyResult<Input> {
-    Ok(match extract_bytes_or_path(value, Err::BadInput)? {
-        Extracted::Bytes(b)          => Input::Owned(b),
-        Extracted::Borrowed(o, s)    => Input::Borrowed(o, s),
-        Extracted::Path(p)           => Input::Path(p)
-    })
-}
-
-fn parse_output(out: Option<&Bound<'_, PyAny>>) -> PyResult<Output> {
-    match out {
-        None => Ok(Output::Return),
-        Some(v) => {
-            let path: String = if let Ok(s) = v.cast::<PyString>() {
-                s.to_str()?.to_string()
-            } else if let Ok(p) = v.call_method0("__fspath__") { // os.PathLike
-                // same fspath-bytes rule as input — a coded error, not a raw downcast
-                if let Ok(s) = p.cast::<PyString>() {
-                    s.to_str()?.to_string()
-                } else if let Ok(b) = p.cast::<PyBytes>() {
-                    String::from_utf8_lossy(b.as_bytes()).into_owned()
-                } else {
-                    return Err(Err::BadOutput.into());
-                }
-            } else {
-                return Err(Err::BadOutput.into());
-            };
-            Ok(Output::Path(path))
-        }
-    }
-}
-
 // strict evidence check, shared by the sync and async tails
-fn check_strict(processed: &process::Processed, key: Option<[u8; 16]>, strict: bool) -> PyResult<()> {
+fn check_strict(fragments: &[process::FragmentStat], key: Option<[u8; 16]>, strict: bool) -> PyResult<()> {
     if strict && key.is_some() {
-        let bad_frags: Vec<String> = processed.fragments.iter()
+        let bad_frags: Vec<String> = fragments.iter()
             .filter(|f| f.corrupt == Some(true))
             .map(|f| format!("#{} chi2={:.0} ({}B)", f.index, f.chi2, f.bytes))
             .collect();
@@ -219,23 +72,17 @@ fn check_strict(processed: &process::Processed, key: Option<[u8; 16]>, strict: b
     Ok(())
 }
 
-// sync tail: corrupt check + write-or-return
-fn finish(processed: process::Processed, output: Output, key: Option<[u8; 16]>, strict: bool) -> PyResult<Option<Vec<u8>>> {
-    check_strict(&processed, key, strict)?;
-    match output {
-        Output::Return  => Ok(Some(processed.data)),
-        Output::Path(p) => {
-            write_atomic(&p, &processed.data)?;
-            Ok(None)
-        }
-    }
-}
-
-// shared head: load input, guard kid, run the fused pass
-fn run(input: Input, key: Option<[u8; 16]>, kid: Option<String>, meta: Option<meta::CoreMeta>, strict: bool) -> Result<process::Processed, Err> {
-    let data: InputData = input.load()?;
-    if key.is_some() { guard_kid(data.bytes(), kid.as_deref())?; } // kid without key is meaningless
-    process::process(data.bytes(), key.as_ref(), strict, meta.as_ref())
+// pass 1, shared by proc/aproc: load input, guard kid, measure the exact
+// output length — all off the GIL; the loaded data and the metadata must
+// survive to pass 2, so the metadata comes back out
+fn load_and_measure(input: input::Input, key: Option<[u8; 16]>, kid: Option<String>, meta: Option<meta::CoreMeta>)
+    -> Result<(InputData, usize, Option<meta::CoreMeta>), Err> {
+    let d: InputData = input.load()?;
+    if key.is_some() { guard_kid(d.bytes(), kid.as_deref())?; }
+    let mut meta = meta;
+    if let Some(m) = meta.as_mut() { meta::pre_resolve_cover(m)?; } // cover codec work once
+    let len: usize = process::measure(d.bytes(), meta.as_ref())?;
+    Ok((d, len, meta))
 }
 
 #[pyclass]
@@ -295,45 +142,10 @@ impl TuneMeta {
     }
 }
 
-// Python TuneMeta → Send CoreMeta: only raw byte copies and path strings happen under
-// the GIL — cover disk read + JPEG prepare (decode/resize/encode) run in the worker
-// None/0/empty fields mean "keep whatever the file already carries".
-fn resolve_meta(py: Python<'_>, meta: Option<&TuneMeta>) -> PyResult<Option<meta::CoreMeta>> {
-    let Some(m) = meta else { return Ok(None) };
-    let cover: Option<meta::RawCover> = match &m.cover {
-        None      => None,
-        Some(obj) => Some(match extract_bytes_or_path(obj.bind(py), Err::BadCover)? {
-            Extracted::Bytes(b)       => meta::RawCover::Bytes(b),
-            // covers are small (≤1MB) — a copy here keeps RawCover simple
-            Extracted::Borrowed(_, s) => meta::RawCover::Bytes(s.to_vec()),
-            Extracted::Path(p)        => meta::RawCover::Path(p)
-        })
-    };
-    let non_zero: fn(Option<u32>) -> Option<u32> = |v| v.filter(|n| *n > 0);
-    let non_empty: fn(&Option<String>) -> Option<String> = |v| v.clone().filter(|s| !s.is_empty());
-    let artists: Option<Vec<String>> = m.artists.clone().map(|a| a.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>()).filter(|a| !a.is_empty());
-
-    Ok(Some(meta::CoreMeta {
-        title       : non_empty(&m.title),
-        date        : non_empty(&m.date),
-        artists,
-        isrc        : non_empty(&m.isrc),
-        track       : non_zero(m.track),
-        track_total : non_zero(m.track_total),
-        disc        : non_zero(m.disc),
-        disc_total  : non_zero(m.disc_total),
-        album       : non_empty(&m.album),
-        genre       : non_empty(&m.genre),
-        lyrics      : non_empty(&m.lyrics),
-        composer    : non_empty(&m.composer),
-        cover
-    }))
-}
-
 // parsed proc/aproc arguments — every Send piece is resolved under the GIL
 // once, then moved wholesale into the worker
 struct Args {
-    input    : Input,
+    input    : input::Input,
     output   : Output,
     key      : Option<[u8; 16]>,
     kid      : Option<String>,
@@ -357,6 +169,42 @@ fn parse_args(
     })
 }
 
+// Python TuneMeta → Send CoreMeta: only raw byte copies and path strings happen under
+// the GIL — cover disk read + JPEG prepare (decode/resize/encode) run in the worker
+// None/0/empty fields mean "keep whatever the file already carries".
+fn resolve_meta(py: Python<'_>, meta: Option<&TuneMeta>) -> PyResult<Option<meta::CoreMeta>> {
+    let Some(m) = meta else { return Ok(None) };
+    let cover: Option<meta::RawCover> = match &m.cover {
+        None      => None,
+        Some(obj) => Some(match input::extract_bytes_or_path(obj.bind(py), Err::BadCover)? {
+            input::Extracted::Bytes(b)       => meta::RawCover::Bytes(b),
+            // covers are small (≤1MB) — a copy here keeps RawCover simple
+            input::Extracted::Borrowed(_, s) => meta::RawCover::Bytes(s.to_vec()),
+            input::Extracted::Path(p)        => meta::RawCover::Path(p)
+        })
+    };
+    let non_zero: fn(Option<u32>) -> Option<u32> = |v| v.filter(|n| *n > 0);
+    let non_empty: fn(&Option<String>) -> Option<String> = |v| v.clone().filter(|s| !s.is_empty());
+    let artists: Option<Vec<String>> = m.artists.clone().map(|a| a.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>()).filter(|a| !a.is_empty());
+
+    Ok(Some(meta::CoreMeta {
+        title       : non_empty(&m.title),
+        date        : non_empty(&m.date),
+        artists,
+        isrc        : non_empty(&m.isrc),
+        track       : non_zero(m.track),
+        track_total : non_zero(m.track_total),
+        disc        : non_zero(m.disc),
+        disc_total  : non_zero(m.disc_total),
+        album       : non_empty(&m.album),
+        genre       : non_empty(&m.genre),
+        lyrics      : non_empty(&m.lyrics),
+        composer    : non_empty(&m.composer),
+        cover,
+        cover_ready : None
+    }))
+}
+
 // Decrypt, fix, write metadata, optionally guard against fake keys — one pass.
 // All parameters keyword-only; returns None (path out) or bytes (no out).
 #[pyfunction]
@@ -370,13 +218,38 @@ fn proc<'py>(
     meta   : Option<&TuneMeta>,
     strict : bool
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let a: Args = parse_args(py, input, out, key, kid, meta)?;
-    let result: Option<Vec<u8>> = py.detach(move || -> PyResult<Option<Vec<u8>>> {
-        let processed: process::Processed = run(a.input, a.key, a.kid, a.core_meta, strict).map_err(PyErr::from)?;
-        finish(processed, a.output, a.key, strict)
-    })?;
+    let Args { input, output, key, kid, core_meta }: Args = parse_args(py, input, out, key, kid, meta)?;
+    let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) =
+        py.detach(move || load_and_measure(input, key, kid, core_meta)).map_err(PyErr::from)?;
 
-    Ok(result.map(|bytes| PyBytes::new(py, &bytes).into_any()))
+    match output {
+        Output::Path(p) => {
+            py.detach(move || -> PyResult<()> {
+                let mut buf: Vec<u8> = vec![0u8; len]; // exact-size output, no over-allocation
+                let fragments: Vec<process::FragmentStat> =
+                    process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
+                check_strict(&fragments, key, strict)?;
+                write_atomic(&p, &buf)?;
+                Ok(())
+            })?;
+            Ok(None)
+        }
+        Output::Return => {
+            // build straight into the freshly allocated Python bytes — no
+            // intermediate copy; the object is exclusively owned until the
+            // handle is returned, so the detached build's &mut is exclusive
+            let bytes: Bound<'py, PyBytes> = PyBytes::new_with(py, len, |_buf: &mut [u8]| Ok(()))?;
+            // the buffer base crosses the detach as a usize — a captured raw
+            // pointer would break Send (disjoint capture hoists it out)
+            let base: usize = bytes.as_bytes().as_ptr() as usize;
+            let fragments: Vec<process::FragmentStat> = py.detach(move || -> PyResult<Vec<process::FragmentStat>> {
+                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, len) };
+                Ok(process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), buf)?)
+            })?;
+            check_strict(&fragments, key, strict)?;
+            Ok(Some(bytes.into_any()))
+        }
+    }
 }
 
 // a worker panic must surface with its real message, not a fake error
@@ -400,24 +273,40 @@ fn aproc<'py>(
     meta   : Option<&TuneMeta>,
     strict : bool
 ) -> PyResult<Bound<'py, PyAny>> {
-    let a: Args = parse_args(py, input, out, key, kid, meta)?;
+    let Args { input, output, key, kid, core_meta }: Args = parse_args(py, input, out, key, kid, meta)?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let processed: process::Processed = tokio::task::spawn_blocking(move || run(a.input, a.key, a.kid, a.core_meta, strict))
-            .await
-            .map_err(join_err)??;
-        check_strict(&processed, a.key, strict)?;
-        match a.output {
-            // write+rename run as ONE blocking task — a cancelled future cannot
-            // split the pair and leave a tmp behind (tokio::fs is spawn_blocking
-            // under the hood anyway, so this frees the worker just as well)
+        let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) = tokio::task::spawn_blocking(
+            move || load_and_measure(input, key, kid, core_meta),
+        ).await.map_err(join_err)??;
+        match output {
             Output::Path(p) => {
-                tokio::task::spawn_blocking(move || write_atomic(&p, &processed.data))
-                    .await
-                    .map_err(join_err)??;
+                // write+rename run inside ONE blocking task with the build — a
+                // cancelled future cannot split the pair and leave a tmp behind
+                tokio::task::spawn_blocking(move || -> PyResult<()> {
+                    let mut buf: Vec<u8> = vec![0u8; len];
+                    let fragments: Vec<process::FragmentStat> =
+                        process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
+                    check_strict(&fragments, key, strict)?;
+                    write_atomic(&p, &buf)?;
+                    Ok(())
+                }).await.map_err(join_err)??;
                 Ok(None)
             }
-            Output::Return  => Ok(Some(processed.data))
+            Output::Return => {
+                // allocate the result under a brief GIL attach, then build off-GIL
+                // straight into its buffer — no intermediate copy
+                let (base, result): (usize, Py<PyBytes>) = Python::attach(|py| -> PyResult<(usize, Py<PyBytes>)> {
+                    let b: Bound<'_, PyBytes> = PyBytes::new_with(py, len, |_buf: &mut [u8]| Ok(()))?;
+                    Ok((b.as_bytes().as_ptr() as usize, b.unbind()))
+                })?;
+                let fragments: Vec<process::FragmentStat> = tokio::task::spawn_blocking(move || -> PyResult<Vec<process::FragmentStat>> {
+                    let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, len) };
+                    Ok(process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), buf)?)
+                }).await.map_err(join_err)??;
+                check_strict(&fragments, key, strict)?;
+                Ok(Some(result))
+            }
         }
     })
 }

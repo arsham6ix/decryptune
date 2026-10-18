@@ -3,7 +3,6 @@
 // scans, EOBRUN — decodes to 1-channel gray or 3-channel RGB.
 
 use super::ZIGZAG;
-use super::build_cos;
 use crate::Err;
 
 struct HuffTable {
@@ -122,24 +121,63 @@ impl Component {
     }
 }
 
-fn idct_block(coef: &[i16], qt: &[u16; 64], cos: &[[f32; 8]; 8], out: &mut [u8; 64]) {
-    let mut f: [[f32; 8]; 8] = [[0.0; 8]; 8];
-    for p in 0..64 {
-        f[p / 8][p % 8] = coef[p] as f32 * qt[p] as f32;
-    }
-    let mut g: [[f32; 8]; 8] = [[0.0; 8]; 8];
-    for v in 0..8 {
-        for x in 0..8 {
-            let mut s: f32 = 0.0;
-            for u in 0..8 { s += f[v][u] * cos[u][x]; }
-            g[v][x] = s;
-        }
+// integer IDCT (zune/stb form, constants ×4096) — pass 1 transforms columns
+// in place keeping 2 extra bits, pass 2 transforms rows into final pixels
+const SCALE_BITS: i32 = 512 + 65536 + (128 << 17);
+
+// one 1-D inverse transform; `final_pass` picks the output scaling:
+// intermediate (>>10) or finished pixel (>>17, bias baked into SCALE_BITS)
+fn idct_1d(v: &[i32; 8], final_pass: bool) -> [i32; 8] {
+    // even part (frequencies 0, 2, 4, 6)
+    let (e2, e6): (i32, i32) = (v[2], v[6]);
+    let p1: i32 = (e2 + e6) * 2217;
+    let t2: i32 = p1 + e6 * -7567;
+    let t3: i32 = p1 + e2 * 3135;
+    let (e0, e4): (i32, i32) = (v[0], v[4]);
+    let t0: i32 = (e0 + e4) << 12;
+    let t1: i32 = (e0 - e4) << 12;
+    let bias: i32 = if final_pass { SCALE_BITS } else { 512 };
+    let (x0, x3): (i32, i32) = (t0 + t3 + bias, t0 - t3 + bias);
+    let (x1, x2): (i32, i32) = (t1 + t2 + bias, t1 - t2 + bias);
+    // odd part (frequencies 7, 5, 3, 1)
+    let (mut o0, mut o1, mut o2, mut o3): (i32, i32, i32, i32) = (v[7], v[5], v[3], v[1]);
+    let p3: i32 = o0 + o2;
+    let p4: i32 = o1 + o3;
+    let p1: i32 = o0 + o3;
+    let p2: i32 = o1 + o2;
+    let p5: i32 = (p3 + p4) * 4816;
+    o0 *= 1223;
+    o1 *= 8410;
+    o2 *= 12586;
+    o3 *= 6149;
+    let p1: i32 = p5 + p1 * -3685;
+    let p2: i32 = p5 + p2 * -10497;
+    let p3: i32 = p3 * -8034;
+    let p4: i32 = p4 * -1597;
+    o3 += p1 + p4;
+    o2 += p2 + p3;
+    o1 += p2 + p4;
+    o0 += p1 + p3;
+    let shift: i32 = if final_pass { 17 } else { 10 };
+    [(x0 + o3) >> shift, (x1 + o2) >> shift, (x2 + o1) >> shift, (x3 + o0) >> shift,
+     (x3 - o0) >> shift, (x2 - o1) >> shift, (x1 - o2) >> shift, (x0 - o3) >> shift]
+}
+
+fn idct_block(coef: &[i16], qt: &[u16; 64], out: &mut [u8; 64]) {
+    let mut ws: [i32; 64] = [0; 64];
+    for p in 0..64 { ws[p] = coef[p] as i32 * qt[p] as i32; } // dequantized
+    for x in 0..8 {
+        let mut v: [i32; 8] = [0; 8];
+        for u in 0..8 { v[u] = ws[x + u * 8]; }
+        let r: [i32; 8] = idct_1d(&v, false);
+        for u in 0..8 { ws[x + u * 8] = r[u]; }
     }
     for y in 0..8 {
+        let mut v: [i32; 8] = [0; 8];
+        v.copy_from_slice(&ws[y * 8..y * 8 + 8]);
+        let r: [i32; 8] = idct_1d(&v, true);
         for x in 0..8 {
-            let mut s: f32 = 128.0;
-            for v in 0..8 { s += g[v][x] * cos[v][y]; }
-            out[y * 8 + x] = s.clamp(0.0, 255.0) as u8;
+            out[y * 8 + x] = r[x].clamp(0, 255) as u8;
         }
     }
 }
@@ -258,7 +296,6 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
     let mut dri: usize = 0;
     let (mut hmax, mut vmax): (usize, usize) = (0, 0);
     let mut scans_done: usize = 0;
-    let cos: [[f32; 8]; 8] = build_cos();
 
     'file: loop {
         // ---- header markers up to SOS ----
@@ -395,7 +432,7 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
             for col in 0..c.blocks_x {
                 let b: usize = (row * c.blocks_x + col) * 64;
                 let mut px: [u8; 64] = [0; 64];
-                idct_block(&c.coefs[b..b + 64], &qt[c.tq], &cos, &mut px);
+                idct_block(&c.coefs[b..b + 64], &qt[c.tq], &mut px);
                 let d: usize = (row * 8) * c.plane_w + col * 8; // pixel row of the block's top edge
                 for r in 0..8 {
                     c.plane[d + r * c.plane_w..d + r * c.plane_w + 8].copy_from_slice(&px[r * 8..r * 8 + 8]);

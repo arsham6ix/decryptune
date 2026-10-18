@@ -47,14 +47,15 @@ Rules that hold for both `proc` and `aproc`:
 
 ## Benchmark
 
-Real 3.0MB fragmented track, Intel i7-11800H (8C/16T), WSL2, v1.1.1:
+Real 3.0MB fragmented track + synthetic fragmented files, Intel i7-11800H (8C/16T), WSL2:
 
 | scenario | result |
 |---|---|
-| decrypt + fix, strict (bytes in/out) | 3.7 ms median — ~0.8 GB/s |
-| fix-only pass (no key) | 1.7 ms |
-| full tags + cover resize (877KB JPEG) | 101 ms |
-| 32 calls: sequential → `asyncio.gather` | 74 ms → 29 ms (**×2.5**) |
+| decrypt + fix, strict (3.0MB, bytes in/out) | 2.4 ms median |
+| fix-only pass (no key, 3.0MB) | 0.3 ms |
+| full tags + cover resize (877KB JPEG) | 208 ms |
+| 32 calls: sequential → `asyncio.gather` | 79 ms → 24 ms (**×3.3**) |
+| 128MB file: fix-only / decrypt / decrypt+strict | 60 / 70 / 101 ms (fragment work spread across cores) |
 | event-loop max lag under 8 concurrent heavy calls | < 4 ms |
 
 ## License

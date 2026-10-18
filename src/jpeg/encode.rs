@@ -3,7 +3,6 @@
 // APP0-JFIF, DQT, SOF0, DHT, SOS and pads the final entropy byte with 1-bits.
 
 use super::ZIGZAG;
-use super::build_cos;
 use crate::Err;
 
 const QUALITY: i32 = 90; // visually lossless at 1000px; q100 bloats ~3.5x
@@ -164,9 +163,9 @@ fn rgb_to_ycc(rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (y, cb, cr)
 }
 
-// forward DCT via the shared orthonormal basis (F = C·f·Cᵀ) — row pass with
-// u as horizontal frequency, column pass with v as vertical frequency, stored
-// coef[v*8+u] to match the decoder's natural-order layout
+// forward DCT via the orthonormal cos basis — row pass with u as horizontal
+// frequency, column pass with v as vertical frequency, stored coef[v*8+u] to
+// match the decoder's natural-order layout
 fn fdct_block(px: &[u8; 64], cos: &[[f32; 8]; 8], out: &mut [i16; 64]) {
     let mut f: [[f32; 8]; 8] = [[0.0; 8]; 8];
     for p in 0..64 { f[p / 8][p % 8] = px[p] as f32 - 128.0; }
@@ -251,7 +250,7 @@ pub(crate) fn encode(pix: &[u8], w: usize, h: usize, ch: usize) -> Result<Vec<u8
         rgb_to_ycc(pix, w, h)
     };
     let (qt_y, qt_c): ([u16; 64], [u16; 64]) = (scale_qt(&Q_LUMA), scale_qt(&Q_CHROMA));
-    let cos: [[f32; 8]; 8] = build_cos();
+    let cos: [[f32; 8]; 8] = super::build_cos();
     let (dc_y, ac_y): (EncTable, EncTable) = (EncTable::build(&DC_LUMA_BITS, &DC_VALS), EncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS));
     let (dc_c, ac_c): (EncTable, EncTable) = (EncTable::build(&DC_CHROMA_BITS, &DC_VALS), EncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS));
 

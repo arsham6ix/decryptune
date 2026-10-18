@@ -35,3 +35,39 @@ pub fn write_header(out: &mut Vec<u8>, typ: &[u8; 4], content_len: usize) {
     out.extend_from_slice(&((content_len + 8) as u32).to_be_bytes());
     out.extend_from_slice(typ);
 }
+
+// output sink — Buf writes into an exactly-sized buffer, Count only measures.
+// The measure pass runs the identical walk with the same sizing decisions, so
+// the buffer can never over- or under-fill.
+pub enum Writer<'a> {
+    Buf { buf: &'a mut [u8], pos: usize },
+    Count(usize)
+}
+
+impl Writer<'_> {
+    pub fn len(&self) -> usize {
+        match self { Writer::Buf { pos, .. } => *pos, Writer::Count(n) => *n }
+    }
+
+    pub fn put(&mut self, bytes: &[u8]) {
+        match self {
+            Writer::Buf { buf, pos } => {
+                buf[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+                *pos += bytes.len();
+            }
+            Writer::Count(n) => *n += bytes.len()
+        }
+    }
+
+    // 32-bit box header (size + fourcc)
+    pub fn header(&mut self, typ: &[u8; 4], content_len: usize) {
+        match self {
+            Writer::Buf { buf, pos } => {
+                buf[*pos..*pos + 4].copy_from_slice(&((content_len + 8) as u32).to_be_bytes());
+                buf[*pos + 4..*pos + 8].copy_from_slice(typ);
+                *pos += 8;
+            }
+            Writer::Count(n) => *n += 8
+        }
+    }
+}

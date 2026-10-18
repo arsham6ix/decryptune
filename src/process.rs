@@ -1,7 +1,9 @@
+use std::ops::Range;
+
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 
-use crate::boxes::{parse, write_header, Box};
+use crate::boxes::{parse, write_header, Box, Writer};
 use crate::meta::{append_moov_with_meta, CoreMeta};
 use crate::Err;
 
@@ -12,6 +14,9 @@ const MAX_TREE_DEPTH: usize = 16;
 // chi2 thresholds calibrated on real AAC tracks (structured ~3800..14000, noise ~210..340)
 const MIN_JUDGE_BYTES: usize = 16 * 1024; // below this, chi2 drowns in the df=255 noise floor
 const CHI2_CORRUPT_BELOW: f64 = 500.0;
+// fragment work is spread over threads only when it is large enough to pay
+// for the spawns (a small single-fragment track stays on one thread)
+const MIN_PAR_BYTES: usize = 8 * 1024 * 1024;
 
 #[allow(dead_code)] // fields beyond `corrupt` are diagnostics for future reporting
 pub(crate) struct FragmentStat {
@@ -22,9 +27,15 @@ pub(crate) struct FragmentStat {
     pub corrupt   : Option<bool> // Some(true)=corrupt, Some(false)=clean, None=not judged
 }
 
-pub(crate) struct Processed {
-    pub data      : Vec<u8>,
-    pub fragments : Vec<FragmentStat>
+// one fragment's phase-2 work: decrypt + judge its own payload range, disjoint
+// from every other job, so the ranges parallelize safely
+struct Job {
+    range    : Range<usize>, // payload span inside the final output buffer
+    ivs      : Option<Vec<[u8; 16]>>,
+    sizes    : Vec<u32>,
+    default  : Option<u32>,
+    encrypted: bool,
+    judged   : bool
 }
 
 struct Plan {
@@ -35,27 +46,47 @@ struct Plan {
     rebuilt_len : usize
 }
 
-// Fused single-walk: decrypt + fix + metadata in one pass, one output buffer
-// (key = None → fix-only pass)
-pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&CoreMeta>) -> Result<Processed, Err> {
+/// Exact output length — the same fused walk as `build`, counting bytes
+/// instead of writing (no payload copy, no decrypt). Cheap: O(parse).
+pub fn measure(data: &[u8], meta: Option<&CoreMeta>) -> Result<usize, Err> {
+    let mut w: Writer<'_> = Writer::Count(0);
+    walk(data, None, false, meta, &mut w)?;
+    Ok(w.len())
+}
+
+/// Run the fused pass into an exactly-sized buffer (`measure` provides the
+/// size). Returns one stat per decrypted fragment, in fragment order.
+pub fn build(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&CoreMeta>, buf: &mut [u8]) -> Result<Vec<FragmentStat>, Err> {
+    let mut w: Writer<'_> = Writer::Buf { buf, pos: 0 };
+    let jobs: Vec<Job> = walk(data, key, strict, meta, &mut w)?;
+    let Writer::Buf { buf, .. } = w else { unreachable!("build always writes a Buf") };
+    Ok(run_jobs(buf, jobs, key))
+}
+
+// fused single-walk: decrypt-plan + sanitize + metadata in one pass over the
+// boxes. Measure mode runs the identical control flow — Writer::Count turns
+// every payload copy into a size add, so the length is exact by construction
+fn walk(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&CoreMeta>, out: &mut Writer<'_>) -> Result<Vec<Job>, Err> {
     let boxes: Vec<Box> = parse(data, 0, data.len());
     if boxes.is_empty() { return Err(Err::InvalidMp4); }
 
-    let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut deltas: Vec<i64> = Vec::new();
     let mut patches: Vec<(usize, Vec<usize>)> = Vec::new(); // (frag base, sidx word offsets)
-    let mut fragments: Vec<FragmentStat> = Vec::new();
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut pending: Option<Range<usize>> = None; // queued passthrough run
 
     let mut i = 0;
     while i < boxes.len() {
         let b: &Box = &boxes[i];
         match &b.typ {
             b"moof" => {
-                let plan: Plan = visit_moof(&mut out, data, b);
+                flush(out, data, &mut pending);
+                let plan: Plan = visit_moof(out, data, b);
                 deltas.push((b.end - b.start) as i64 - plan.rebuilt_len as i64);
                 if i + 1 < boxes.len() && boxes[i + 1].is(b"mdat") {
-                    let stat: FragmentStat = emit_mdat(&mut out, data, &boxes[i + 1], key, &plan, strict);
-                    fragments.push(FragmentStat { index: fragments.len(), ..stat });
+                    if let Some(job) = stage_mdat(out, data, &boxes[i + 1], plan, key, strict) {
+                        jobs.push(job);
+                    }
                     i += 2;
                 } else {
                     i += 1;
@@ -63,6 +94,7 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
                 continue;
             }
             b"moov" => {
+                flush(out, data, &mut pending);
                 let children: Vec<u8> = rebuild_container(data, b.content_start, b.end, 0);
                 if let Some(m) = meta {
                     // chunk offsets point into mdat — growing moov breaks them only
@@ -74,44 +106,44 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
                     if has_chunk_offsets(&children, 0) && (mdat_after || shifted) {
                         return Err(Err::MetaNeedsFragmented);
                     }
-                    append_moov_with_meta(&mut out, &children, m)?;
+                    append_moov_with_meta(out, &children, m)?;
                 } else {
-                    write_header(&mut out, b"moov", children.len());
-                    out.extend_from_slice(&children);
+                    out.header(b"moov", children.len());
+                    out.put(&children);
                 }
             }
             b"sidx" => {
+                flush(out, data, &mut pending);
                 let base: usize = out.len();
-                out.extend_from_slice(&data[b.start..b.end]);
+                out.put(&data[b.start..b.end]);
                 patches.push((deltas.len(), sidx_words(data, b, base)));
             }
-            _ => out.extend_from_slice(&data[b.start..b.end])
+            _ => {
+                // queue passthrough boxes into contiguous runs — one memcpy per run
+                pending = match pending.take() {
+                    Some(r) if r.end == b.start => Some(r.start..b.end),
+                    Some(r) => { out.put(&data[r.start..r.end]); Some(b.start..b.end) }
+                    None    => Some(b.start..b.end)
+                };
+            }
         }
         i += 1;
     }
+    flush(out, data, &mut pending);
 
     // patch sidx referenced sizes in place, now that fragment deltas are known
-    patch_sidx(&mut out, &deltas, &patches);
-
-    Ok(Processed { data: out, fragments })
-}
-
-// referenced_size words shrink by each fragment's rebuild delta; out-of-range
-// or non-shrinking entries are left untouched
-fn patch_sidx(out: &mut [u8], deltas: &[i64], patches: &[(usize, Vec<usize>)]) {
-    for (frag_base, words) in patches {
-        for (k, &off) in words.iter().enumerate() {
-            let fi: usize = frag_base + k;
-            if fi >= deltas.len() || deltas[fi] <= 0 || off + 4 > out.len() { continue; }
-            let d: u32 = (deltas[fi] as u64).min(0x7FFF_FFFF) as u32;
-            let word: u32 = u32::from_be_bytes(out[off..off + 4].try_into().unwrap());
-            let new: u32 = (word & 0x7FFF_FFFF).saturating_sub(d);
-            out[off..off + 4].copy_from_slice(&((word & 0x8000_0000) | (new & 0x7FFF_FFFF)).to_be_bytes());
-        }
+    if let Writer::Buf { buf, pos } = &mut *out {
+        patch_sidx(&mut buf[..*pos], &deltas, &patches);
     }
+    Ok(jobs)
 }
 
-fn visit_moof(out: &mut Vec<u8>, data: &[u8], b: &Box) -> Plan {
+// emit a queued passthrough run as one memcpy instead of per-box copies
+fn flush(out: &mut Writer<'_>, data: &[u8], pending: &mut Option<Range<usize>>) {
+    if let Some(r) = pending.take() { out.put(&data[r.start..r.end]); }
+}
+
+fn visit_moof(out: &mut Writer<'_>, data: &[u8], b: &Box) -> Plan {
     let mut content: Vec<u8> = Vec::new();
     let mut ivs: Option<Vec<[u8; 16]>> = None;
     let mut sizes: Vec<u32> = Vec::new();
@@ -145,8 +177,7 @@ fn visit_moof(out: &mut Vec<u8>, data: &[u8], b: &Box) -> Plan {
             match &t.typ {
                 b"senc" | b"saiz" | b"saio" => {}
                 b"trun"                     => {
-                    write_header(&mut traf_out, b"trun", t.end - t.content_start);
-                    traf_out.extend_from_slice(&patch_trun(data, t.content_start, t.end, removed));
+                    write_traf_trun(&mut traf_out, data, t, removed);
                 }
                 _ => traf_out.extend_from_slice(&data[t.start..t.end])
             }
@@ -159,15 +190,17 @@ fn visit_moof(out: &mut Vec<u8>, data: &[u8], b: &Box) -> Plan {
     // stored in the clear); skip decryption for it
     let ok: bool = matches!(&ivs, Some(list) if !sizes.is_empty() && list.len() == sizes.len());
 
-    write_header(out, b"moof", content.len());
-    out.extend_from_slice(&content);
+    out.header(b"moof", content.len());
+    out.put(&content);
     Plan { ivs, sizes, default: default_size, ok, rebuilt_len: content.len() + 8 }
 }
 
-// 16 sub-histograms break the same-bucket increment dependency chain (16
-// independent chains instead of one) — the scalar loop was the whole strict cost
-const CHI2_LANES: usize = 16;
+fn write_traf_trun(traf_out: &mut Vec<u8>, data: &[u8], t: &Box, removed: i64) {
+    write_header(traf_out, b"trun", t.end - t.content_start);
+    traf_out.extend_from_slice(&patch_trun(data, t.content_start, t.end, removed));
+}
 
+// chi2 costs a full pass over the payload — paid per fragment in phase 2
 fn chi2(buf: &[u8]) -> f64 {
     let n: usize = buf.len();
     if n == 0 { return 0.0; }
@@ -185,45 +218,87 @@ fn chi2(buf: &[u8]) -> f64 {
     total.iter().map(|&o| { let d: f64 = o as f64 - e; d * d / e }).sum()
 }
 
-fn emit_mdat(
-    out    : &mut Vec<u8>,
-    data   : &[u8],
-    m      : &Box,
-    key    : Option<&[u8; 16]>,
-    plan   : &Plan,
-    strict : bool
-) -> FragmentStat {
-    // a largesize (64-bit) mdat keeps its 64-bit header — a u32 rewrite would wrap
+// 16 sub-histograms break the same-bucket increment dependency chain (16
+// independent chains instead of one) — the scalar loop was the whole strict cost
+const CHI2_LANES: usize = 16;
+
+fn stage_mdat(out: &mut Writer<'_>, data: &[u8], m: &Box, plan: Plan, key: Option<&[u8; 16]>, strict: bool) -> Option<Job> {
     let content_len: usize = m.end - m.content_start;
+    // a largesize (64-bit) mdat keeps its 64-bit header — a u32 rewrite would wrap
     if content_len + 8 > u32::MAX as usize || u32::from_be_bytes(data[m.start..m.start + 4].try_into().unwrap()) == 1 {
-        out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(b"mdat");
-        out.extend_from_slice(&((content_len as u64) + 16).to_be_bytes());
+        out.put(&1u32.to_be_bytes());
+        out.put(b"mdat");
+        out.put(&((content_len as u64) + 16).to_be_bytes());
     } else {
-        write_header(out, b"mdat", content_len);
+        out.header(b"mdat", content_len);
     }
     let base: usize = out.len();
-    out.extend_from_slice(&data[m.content_start..m.end]);
+    out.put(&data[m.content_start..m.end]);
     let encrypted: bool = plan.ok;
-    if encrypted {
-        if let (Some(iv_list), Some(key)) = (&plan.ivs, key) {
-            let mut pos: usize = base;
-            for (iv, &sz) in iv_list.iter().zip(plan.sizes.iter()) {
+    // measure mode records no jobs — phase 2 never runs there
+    let Writer::Buf { .. } = out else { return None };
+    Some(Job {
+        range    : base..out.len(),
+        ivs      : plan.ivs,
+        sizes    : plan.sizes,
+        default  : plan.default,
+        encrypted,
+        judged   : encrypted && key.is_some() && strict && content_len >= MIN_JUDGE_BYTES
+    })
+}
+
+// phase 2: decrypt + judge every fragment. Small jobs stay on the calling
+// thread; large batches split across worker threads over the disjoint payload
+// ranges (the raw view is exclusive — `buf` is untouched elsewhere in the scope)
+fn run_jobs(buf: &mut [u8], jobs: Vec<Job>, key: Option<&[u8; 16]>) -> Vec<FragmentStat> {
+    if jobs.is_empty() { return Vec::new(); }
+    let total: usize = jobs.iter().map(|j| j.range.len()).sum();
+    let threads: usize = if key.is_some() && jobs.len() > 1 && total >= MIN_PAR_BYTES {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(jobs.len())
+    } else {
+        1
+    };
+    let mut stats: Vec<FragmentStat> = if threads == 1 {
+        jobs.iter().map(|job| decrypt_job(&mut buf[job.range.clone()], job, key)).collect()
+    } else {
+        // the buffer base crosses threads as a usize — disjoint capture would
+        // otherwise hoist the raw pointer out of any wrapper and break Send
+        let base: usize = buf.as_ptr() as usize;
+        let chunk: usize = jobs.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = jobs.chunks(chunk)
+                .map(|group| s.spawn(move || -> Vec<FragmentStat> {
+                    group.iter().map(|job| {
+                        let piece: &mut [u8] = unsafe {
+                            std::slice::from_raw_parts_mut((base + job.range.start) as *mut u8, job.range.len())
+                        };
+                        decrypt_job(piece, job, key)
+                    }).collect()
+                }))
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().expect("decrypt worker panicked")).collect()
+        })
+    };
+    for (i, f) in stats.iter_mut().enumerate() { f.index = i; }
+    stats
+}
+
+fn decrypt_job(buf: &mut [u8], job: &Job, key: Option<&[u8; 16]>) -> FragmentStat {
+    if job.encrypted {
+        if let (Some(ivs), Some(key)) = (&job.ivs, key) {
+            let mut pos: usize = 0;
+            for (iv, &sz) in ivs.iter().zip(job.sizes.iter()) {
                 // a zero entry in a per-entry table means "use the tfhd default"
-                let sz: usize = if sz == 0 { plan.default.unwrap_or(0) } else { sz } as usize;
-                if sz == 0 || pos + sz > out.len() { break; } // continuing would misalign every later sample
-                Aes128Ctr::new(key.into(), iv.into()).apply_keystream(&mut out[pos..pos + sz]);
+                let sz: usize = if sz == 0 { job.default.unwrap_or(0) } else { sz } as usize;
+                if sz == 0 || pos + sz > buf.len() { break; } // continuing would misalign every later sample
+                Aes128Ctr::new(key.into(), iv.into()).apply_keystream(&mut buf[pos..pos + sz]);
                 pos += sz;
             }
         }
     }
-
-    let payload: &[u8] = &out[base..];
-    // chi2 costs a full pass over the payload — pay it only when a verdict is requested
-    let judged: bool = encrypted && key.is_some() && strict && payload.len() >= MIN_JUDGE_BYTES;
-    let chi2: f64 = if judged { chi2(payload) } else { 0.0 };
-    let corrupt = if !encrypted { Some(false) } else if !judged { None } else { Some(chi2 < CHI2_CORRUPT_BELOW) };
-    FragmentStat { index: 0, encrypted, bytes: payload.len(), chi2, corrupt }
+    let chi2: f64 = if job.judged { chi2(buf) } else { 0.0 };
+    let corrupt = if !job.encrypted { Some(false) } else if !job.judged { None } else { Some(chi2 < CHI2_CORRUPT_BELOW) };
+    FragmentStat { index: 0, encrypted: job.encrypted, bytes: buf.len(), chi2, corrupt }
 }
 
 // absolute chunk offsets dangle once moov grows — fragmented files carry empty stco
@@ -332,6 +407,21 @@ fn sidx_words(data: &[u8], b: &Box, out_base: usize) -> Vec<usize> {
     let count: usize = u16::from_be_bytes(data[start + entries - 2..start + entries].try_into().unwrap()) as usize;
     if start + entries + count * 12 > b.end { return Vec::new(); }
     (0..count).map(|k| out_base + (start - b.start) + entries + k * 12).collect()
+}
+
+// referenced_size words shrink by each fragment's rebuild delta; out-of-range
+// or non-shrinking entries are left untouched
+fn patch_sidx(out: &mut [u8], deltas: &[i64], patches: &[(usize, Vec<usize>)]) {
+    for (frag_base, words) in patches {
+        for (k, &off) in words.iter().enumerate() {
+            let fi: usize = frag_base + k;
+            if fi >= deltas.len() || deltas[fi] <= 0 || off + 4 > out.len() { continue; }
+            let d: u32 = (deltas[fi] as u64).min(0x7FFF_FFFF) as u32;
+            let word: u32 = u32::from_be_bytes(out[off..off + 4].try_into().unwrap());
+            let new: u32 = (word & 0x7FFF_FFFF).saturating_sub(d);
+            out[off..off + 4].copy_from_slice(&((word & 0x8000_0000) | (new & 0x7FFF_FFFF)).to_be_bytes());
+        }
+    }
 }
 
 fn rebuild_container(data: &[u8], start: usize, end: usize, depth: usize) -> Vec<u8> {

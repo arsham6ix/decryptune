@@ -44,6 +44,22 @@ jobs:
             echo "new version v$V — full build + release"
           fi
 
+  # tests gate the release: pytest e2e against the built extension + codec
+  # unit tests (fixture-dependent pixel tests skip without JPEG_FIXTURES)
+  test:
+    needs: verify
+    if: needs.verify.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+      - run: python3 -m pip install pytest pycryptodome mutagen
+      - run: python3 -m pytest tests/ -q
+      - run: cargo test --release
+
   # abi3 wheels: linux + windows (manylinux_2_28 for the widest glibc coverage)
   wheels:
     needs: verify
@@ -94,7 +110,7 @@ jobs:
           path: dist/*.tar.gz
 
   release:
-    needs: [verify, wheels, sdist]
+    needs: [verify, test, wheels, sdist]
     if: ${{ !failure() && !cancelled() && needs.verify.outputs.release == 'true' }}
     runs-on: ubuntu-latest
     steps:

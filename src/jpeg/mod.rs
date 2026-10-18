@@ -21,8 +21,8 @@ const ZIGZAG: [usize; 64] = [
 ];
 
 // orthonormal 1-D DCT basis C(u)·cos((2x+1)uπ/16) — built at runtime because
-// float methods are not const-evaluable; shared by IDCT (decode) and FDCT
-// (encode), where the forward transform is the transposed use of this matrix
+// float methods are not const-evaluable; shared by the encoder's FDCT (the
+// decoder uses the integer IDCT in decode.rs)
 pub(super) fn build_cos() -> [[f32; 8]; 8] {
     let mut t: [[f32; 8]; 8] = [[0.0; 8]; 8];
     for (u, row) in t.iter_mut().enumerate() {

@@ -36,7 +36,7 @@ fn fixtures() {
     }
 }
 
-fn base_or_big() -> bool { std::env::var("USE_BIG").is_ok() || std::env::var("USE_BASE").is_ok() }
+fn base_or_big() -> bool { std::env::var("USE_BIG").is_ok() } // b444/p444 fixtures are 100x80
 
 #[test]
 fn pixel_accuracy_vs_pillow() {
