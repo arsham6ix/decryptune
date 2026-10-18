@@ -6,8 +6,8 @@ use std::borrow::Cow;
 use crate::boxes::{parse, write_header};
 use crate::Err;
 
-pub(crate) struct Cover {
-    pub data: Vec<u8>,
+pub(crate) struct Cover<'a> {
+    pub data: Cow<'a, [u8]>,
     pub kind: u32 // ilst data-type: 13 = JPEG, 14 = PNG
 }
 
@@ -106,8 +106,9 @@ fn build_items(meta: &CoreMeta) -> Result<Vec<u8>, Err> {
     if let Some(num) = meta.track { out.extend_from_slice(&item(b"trkn", 0, &num_pair(num, meta.track_total))); }
     if let Some(num) = meta.disc { out.extend_from_slice(&item(b"disk", 0, &num_pair(num, meta.disc_total))); }
     if let Some(raw) = &meta.cover {
-        let prepared = crate::cover::prepare(&raw.materialize()?)?;
-        out.extend_from_slice(&item(b"covr", prepared.kind, &prepared.data));
+        let bytes: Cow<'_, [u8]> = raw.materialize()?;
+        let prepared: Cover<'_> = crate::cover::prepare(&bytes)?;
+        out.extend_from_slice(&item(b"covr", prepared.kind, prepared.data.as_ref()));
     }
     Ok(out)
 }
@@ -137,24 +138,26 @@ fn meta_box(ilst: &[u8]) -> Vec<u8> {
 // metadata is written from scratch: any pre-existing ilst is wiped and rebuilt
 // solely from the caller's TuneMeta (deterministic, no merging); the fresh
 // udta/meta/ilst subtree goes first in moov — any pre-existing udta (with its
-// ilst) is removed entirely
-pub(crate) fn rebuild_moov_with_meta(children: &[u8], meta: &CoreMeta) -> Result<Vec<u8>, Err> {
+// ilst) is removed entirely. The whole moov is appended to `out` in one shot
+// (no intermediate content buffer).
+pub(crate) fn append_moov_with_meta(out: &mut Vec<u8>, children: &[u8], meta: &CoreMeta) -> Result<(), Err> {
     // every old udta goes — keeping any would both leak stale tags and shadow the
     // fresh subtree for the Windows handler (it reads only the first udta/meta)
     let udta: Vec<(usize, usize)> = parse(children, 0, children.len())
         .iter().filter(|c| c.is(b"udta")).map(|c| (c.start, c.end)).collect();
 
     let new_meta: Vec<u8> = meta_box(&build_items(meta)?);
+    let removed: usize = udta.iter().map(|(s, e)| e - s).sum();
+    write_header(out, b"moov", 8 + new_meta.len() + children.len() - removed);
+    write_header(out, b"udta", new_meta.len());
 
     // udta goes first in moov — the Windows MP4 handler reads only the first udta/meta subtree
-    let mut out: Vec<u8> = Vec::with_capacity(children.len() + new_meta.len());
-    write_header(&mut out, b"udta", new_meta.len());
     out.extend_from_slice(&new_meta);
     let mut pos: usize = 0;
-    for (start, end) in udta {
-        out.extend_from_slice(&children[pos..start]);
-        pos = end;
+    for (start, end) in &udta {
+        out.extend_from_slice(&children[pos..*start]);
+        pos = *end;
     }
     out.extend_from_slice(&children[pos..]);
-    Ok(out)
+    Ok(())
 }

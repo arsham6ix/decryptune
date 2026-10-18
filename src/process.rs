@@ -2,7 +2,7 @@ use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use crate::boxes::{parse, write_header, Box};
-use crate::meta::{rebuild_moov_with_meta, CoreMeta};
+use crate::meta::{append_moov_with_meta, CoreMeta};
 use crate::Err;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
@@ -64,7 +64,7 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
             }
             b"moov" => {
                 let children: Vec<u8> = rebuild_container(data, b.content_start, b.end, 0);
-                let children: Vec<u8> = if let Some(m) = meta {
+                if let Some(m) = meta {
                     // chunk offsets point into mdat — growing moov breaks them only
                     // when an mdat sits after moov or an earlier moof rebuild shifted
                     // the data; in the moov-at-end layout the write is safe even
@@ -74,12 +74,11 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
                     if has_chunk_offsets(&children, 0) && (mdat_after || shifted) {
                         return Err(Err::MetaNeedsFragmented);
                     }
-                    rebuild_moov_with_meta(&children, m)?
+                    append_moov_with_meta(&mut out, &children, m)?;
                 } else {
-                    children
-                };
-                write_header(&mut out, b"moov", children.len());
-                out.extend_from_slice(&children);
+                    write_header(&mut out, b"moov", children.len());
+                    out.extend_from_slice(&children);
+                }
             }
             b"sidx" => {
                 let base: usize = out.len();
@@ -92,7 +91,15 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
     }
 
     // patch sidx referenced sizes in place, now that fragment deltas are known
-    for (frag_base, words) in &patches {
+    patch_sidx(&mut out, &deltas, &patches);
+
+    Ok(Processed { data: out, fragments })
+}
+
+// referenced_size words shrink by each fragment's rebuild delta; out-of-range
+// or non-shrinking entries are left untouched
+fn patch_sidx(out: &mut [u8], deltas: &[i64], patches: &[(usize, Vec<usize>)]) {
+    for (frag_base, words) in patches {
         for (k, &off) in words.iter().enumerate() {
             let fi: usize = frag_base + k;
             if fi >= deltas.len() || deltas[fi] <= 0 || off + 4 > out.len() { continue; }
@@ -102,8 +109,6 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
             out[off..off + 4].copy_from_slice(&((word & 0x8000_0000) | (new & 0x7FFF_FFFF)).to_be_bytes());
         }
     }
-
-    Ok(Processed { data: out, fragments })
 }
 
 fn visit_moof(out: &mut Vec<u8>, data: &[u8], b: &Box) -> Plan {

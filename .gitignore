@@ -1,4 +1,5 @@
 # build artifacts
+Cargo.lock
 target/
 build/
 dist/

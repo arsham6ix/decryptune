@@ -330,6 +330,33 @@ fn resolve_meta(py: Python<'_>, meta: Option<&TuneMeta>) -> PyResult<Option<meta
     }))
 }
 
+// parsed proc/aproc arguments — every Send piece is resolved under the GIL
+// once, then moved wholesale into the worker
+struct Args {
+    input    : Input,
+    output   : Output,
+    key      : Option<[u8; 16]>,
+    kid      : Option<String>,
+    core_meta: Option<meta::CoreMeta>
+}
+
+fn parse_args(
+    py   : Python<'_>,
+    input: &Bound<'_, PyAny>,
+    out  : Option<&Bound<'_, PyAny>>,
+    key  : Option<&str>,
+    kid  : Option<&str>,
+    meta : Option<&TuneMeta>
+) -> PyResult<Args> {
+    Ok(Args {
+        input    : parse_input(input)?,
+        output   : parse_output(out)?,
+        key      : key.map(parse_hex16).transpose()?,
+        kid      : kid.map(|s| s.to_string()),
+        core_meta: resolve_meta(py, meta)?
+    })
+}
+
 // Decrypt, fix, write metadata, optionally guard against fake keys — one pass.
 // All parameters keyword-only; returns None (path out) or bytes (no out).
 #[pyfunction]
@@ -343,15 +370,10 @@ fn proc<'py>(
     meta   : Option<&TuneMeta>,
     strict : bool
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let input: Input = parse_input(input)?;
-    let output: Output = parse_output(out)?;
-    let key: Option<[u8; 16]> = key.map(parse_hex16).transpose()?;
-    let core_meta: Option<meta::CoreMeta> = resolve_meta(py, meta)?;
-    let kid: Option<String> = kid.map(|s| s.to_string());
-
+    let a: Args = parse_args(py, input, out, key, kid, meta)?;
     let result: Option<Vec<u8>> = py.detach(move || -> PyResult<Option<Vec<u8>>> {
-        let processed: process::Processed = run(input, key, kid, core_meta, strict).map_err(PyErr::from)?;
-        finish(processed, output, key, strict)
+        let processed: process::Processed = run(a.input, a.key, a.kid, a.core_meta, strict).map_err(PyErr::from)?;
+        finish(processed, a.output, a.key, strict)
     })?;
 
     Ok(result.map(|bytes| PyBytes::new(py, &bytes).into_any()))
@@ -378,18 +400,14 @@ fn aproc<'py>(
     meta   : Option<&TuneMeta>,
     strict : bool
 ) -> PyResult<Bound<'py, PyAny>> {
-    let input: Input = parse_input(input)?;
-    let output: Output = parse_output(out)?;
-    let key: Option<[u8; 16]> = key.map(parse_hex16).transpose()?;
-    let core_meta: Option<meta::CoreMeta> = resolve_meta(py, meta)?;
-    let kid: Option<String> = kid.map(|s| s.to_string());
+    let a: Args = parse_args(py, input, out, key, kid, meta)?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let processed: process::Processed = tokio::task::spawn_blocking(move || run(input, key, kid, core_meta, strict))
+        let processed: process::Processed = tokio::task::spawn_blocking(move || run(a.input, a.key, a.kid, a.core_meta, strict))
             .await
             .map_err(join_err)??;
-        check_strict(&processed, key, strict)?;
-        match output {
+        check_strict(&processed, a.key, strict)?;
+        match a.output {
             // write+rename run as ONE blocking task — a cancelled future cannot
             // split the pair and leave a tmp behind (tokio::fs is spawn_blocking
             // under the hood anyway, so this frees the worker just as well)

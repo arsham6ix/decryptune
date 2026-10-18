@@ -1,7 +1,8 @@
 // Cover prep: oversized JPEGs → area-average downscale to 1000px, q90 re-encode;
-// fitting covers and PNGs pass through byte-identical (minimal deps, no `image` crate)
+// fitting covers and PNGs pass through zero-copy (no `image` crate, no external
+// JPEG codec — decode and encode both live in crate::jpeg)
 
-use jpeg_encoder::{Encoder, ColorType};
+use std::borrow::Cow;
 
 use crate::jpeg;
 use crate::meta::Cover;
@@ -13,9 +14,9 @@ pub(crate) fn is_jpeg(b: &[u8]) -> bool { b.len() >= 2 && b[0] == 0xFF && b[1] =
 pub(crate) fn is_png(b: &[u8]) -> bool { b.len() >= 8 && b[0..4] == [0x89, 0x50, 0x4E, 0x47] }
 
 /// Validate and (when needed) downscale a cover image to fit MAX_EDGE.
-pub(crate) fn prepare(raw: &[u8]) -> Result<Cover, Err> {
+pub(crate) fn prepare(raw: &[u8]) -> Result<Cover<'_>, Err> {
     if is_png(raw) {
-        return Ok(Cover { data: raw.to_vec(), kind: 14 });
+        return Ok(Cover { data: Cow::Borrowed(raw), kind: 14 });
     }
     if !is_jpeg(raw) {
         return Err(Err::BadCover);
@@ -23,12 +24,11 @@ pub(crate) fn prepare(raw: &[u8]) -> Result<Cover, Err> {
 
     let (w, h, ch, pixels): (usize, usize, usize, Vec<u8>) = jpeg::decode(raw)?;
     if w <= MAX_EDGE as usize && h <= MAX_EDGE as usize {
-        return Ok(Cover { data: raw.to_vec(), kind: 13 }); // fits — original bytes untouched
+        return Ok(Cover { data: Cow::Borrowed(raw), kind: 13 }); // fits — original bytes untouched
     }
     let (nw, nh): (u32, u32) = fit(w as u32, h as u32, MAX_EDGE);
     let scaled: Vec<u8> = resize_area(&pixels, w as u32, h as u32, ch, nw, nh);
-    let color: ColorType = if ch == 1 { ColorType::Luma } else { ColorType::Rgb };
-    Ok(Cover { data: encode_jpeg(&scaled, nw, nh, color)?, kind: 13 })
+    Ok(Cover { data: Cow::Owned(jpeg::encode(&scaled, nw as usize, nh as usize, ch)?), kind: 13 })
 }
 
 /// Longest-edge fit: (nw, nh) ≤ max_edge preserving aspect ratio.
@@ -64,14 +64,4 @@ fn resize_area(src: &[u8], sw: u32, sh: u32, ch: usize, dw: u32, dh: u32) -> Vec
         }
     }
     out
-}
-
-fn encode_jpeg(pixels: &[u8], w: u32, h: u32, color: ColorType) -> Result<Vec<u8>, Err> {
-    let mut out: Vec<u8> = Vec::new();
-    // q90 — visually lossless at 1000px; q100 bloats photographic covers ~3.5x
-    let encoder: Encoder<&mut Vec<u8>> = Encoder::new(&mut out, 90);
-    encoder
-        .encode(pixels, w as u16, h as u16, color)
-        .map_err(|_| Err::BadCover)?;
-    Ok(out)
 }

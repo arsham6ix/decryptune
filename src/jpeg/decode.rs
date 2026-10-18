@@ -1,20 +1,10 @@
-// Sequential + progressive JPEG decoder, hand-rolled — everything cover art
-// needs (SOF0/1/2, 8-bit Huffman, gray/YCbCr, restart markers, DC/AC
-// successive-approximation scans, EOBRUN). CMYK/lossless/arithmetic surface
-// as Err::BadCover. Decodes to 1-channel gray or 3-channel RGB.
+// Sequential + progressive JPEG decoder. Everything cover art needs — SOF0/1/2,
+// 8-bit Huffman, gray/YCbCr, restart markers, DC/AC successive-approximation
+// scans, EOBRUN — decodes to 1-channel gray or 3-channel RGB.
 
+use super::ZIGZAG;
+use super::build_cos;
 use crate::Err;
-
-const ZIGZAG: [usize; 64] = [
-     0,  1,  8, 16,  9,  2,  3, 10,
-    17, 24, 32, 25, 18, 11,  4,  5,
-    12, 19, 26, 33, 40, 48, 41, 34,
-    27, 20, 13,  6,  7, 14, 21, 28,
-    35, 42, 49, 56, 57, 50, 43, 36,
-    29, 22, 15, 23, 30, 37, 44, 51,
-    58, 59, 52, 45, 38, 31, 39, 46,
-    53, 60, 61, 54, 47, 55, 62, 63
-];
 
 struct HuffTable {
     counts    : [u8; 17],   // symbols per code length 1..=16
@@ -130,19 +120,6 @@ impl Component {
         let b: usize = (row * self.blocks_x + col) * 64;
         &mut self.coefs[b..b + 64]
     }
-}
-
-// orthonormal 1-D inverse basis C(u)·cos((2x+1)uπ/16) — built at runtime
-// (float methods are not const-evaluable)
-fn build_cos() -> [[f32; 8]; 8] {
-    let mut t: [[f32; 8]; 8] = [[0.0; 8]; 8];
-    for (u, row) in t.iter_mut().enumerate() {
-        for (x, cell) in row.iter_mut().enumerate() {
-            let c: f32 = ((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI / 16.0).cos();
-            *cell = if u == 0 { 0.35355339 * c } else { 0.5 * c };
-        }
-    }
-    t
 }
 
 fn idct_block(coef: &[i16], qt: &[u16; 64], cos: &[[f32; 8]; 8], out: &mut [u8; 64]) {
@@ -290,7 +267,7 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
             let m: u8 = raw[pos + 1];
             pos += 2;
             match m {
-                0xC0 | 0xC1 | 0xC2 => { // SOF0/1 sequential, SOF2 progressive
+                0xC0..=0xC2 => { // SOF0/1 sequential, SOF2 progressive
                     let seg: usize = read_be16(raw, pos)?;
                     if seg < 8 || pos + seg > raw.len() || raw[pos + 2] != 8 { return Err(Err::BadCover); }
                     h = u16::from_be_bytes([raw[pos + 3], raw[pos + 4]]) as usize;
@@ -324,12 +301,12 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
                     // block grid is padded to whole MCUs (interleaved scans write
                     // edge blocks of partial MCUs); non-interleaved scans stop at
                     // the frame tiles instead
-                    let (mx, my): (usize, usize) = ((w + hmax * 8 - 1) / (hmax * 8), (h + vmax * 8 - 1) / (vmax * 8));
+                    let (mx, my): (usize, usize) = (w.div_ceil(hmax * 8), h.div_ceil(vmax * 8));
                     for c in &mut comps {
                         c.blocks_x = mx * c.h;
                         c.blocks_y = my * c.v;
-                        c.tile_x = ((w * c.h + hmax - 1) / hmax + 7) / 8;
-                        c.tile_y = ((h * c.v + vmax - 1) / vmax + 7) / 8;
+                        c.tile_x = (w * c.h).div_ceil(hmax).div_ceil(8);
+                        c.tile_y = (h * c.v).div_ceil(vmax).div_ceil(8);
                         c.coefs = vec![0i16; c.blocks_x * c.blocks_y * 64];
                     }
                     pos += seg;
@@ -405,76 +382,8 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
             }
         };
 
-        // ---- run one scan ----
-        let interleaved: bool = scan.len() > 1;
-        let (ux_n, uy_n): (usize, usize) = if interleaved {
-            ((w + hmax * 8 - 1) / (hmax * 8), (h + vmax * 8 - 1) / (vmax * 8))
-        } else {
-            (comps[scan[0]].tile_x, comps[scan[0]].tile_y)
-        };
-        for &ci in &scan { comps[ci].dc_pred = 0; } // predictors reset at every scan
-        let mut br: BitReader<'_> = BitReader { data: raw, pos, bits: 0, nbits: 0 };
-        let (mut rst, mut unit, mut eobrun): (u8, usize, u32) = (0, 0, 0);
-        for uy in 0..uy_n {
-            for ux in 0..ux_n {
-                if dri > 0 && unit > 0 && unit % dri == 0 {
-                    br.take_restart(rst)?;
-                    rst = (rst + 1) & 7;
-                    for &ci in &scan { comps[ci].dc_pred = 0; }
-                }
-                for &ci in &scan {
-                    let (bh, bv, dsel, asel): (usize, usize, usize, usize) =
-                        (comps[ci].h, comps[ci].v, comps[ci].dc_sel, comps[ci].ac_sel);
-                    let blocks: Vec<(usize, usize)> = if interleaved {
-                        (0..bv).flat_map(|by| (0..bh).map(move |bx| (ux * bh + bx, uy * bv + by))).collect()
-                    } else {
-                        vec![(ux, uy)]
-                    };
-                    for (col, row) in blocks {
-                        if ss == 0 && se == 0 { // DC-only scan
-                            if ah == 0 {
-                                let dc: &HuffTable = dcs[dsel].as_ref().ok_or(Err::BadCover)?;
-                                dc_first(&mut comps[ci], &mut br, dc, al, col, row)?;
-                            } else {
-                                dc_refine(&mut comps[ci], &mut br, al, col, row)?;
-                            }
-                        } else if ah == 0 && ss == 0 && se == 63 { // full sequential scan
-                            let dc: &HuffTable = dcs[dsel].as_ref().ok_or(Err::BadCover)?;
-                            let ac: &HuffTable = acs[asel].as_ref().ok_or(Err::BadCover)?;
-                            let t: u8 = dc.decode(&mut br)?;
-                            let diff: i32 = extend(br.receive(t as u32)?, t as u32);
-                            comps[ci].dc_pred += diff;
-                            let pred: i16 = comps[ci].dc_pred as i16;
-                            let coef: &mut [i16] = comps[ci].block(col, row);
-                            coef[0] = pred;
-                            let mut k: usize = 1;
-                            while k < 64 {
-                                let rs: u8 = ac.decode(&mut br)?;
-                                let (r, s): (usize, i32) = ((rs >> 4) as usize, (rs & 0xF) as i32);
-                                if s == 0 {
-                                    if r == 15 { k += 16; continue; }
-                                    break;
-                                }
-                                k += r;
-                                if k > 63 { return Err(Err::BadCover); }
-                                coef[ZIGZAG[k]] = extend(br.receive(s as u32)?, s as u32) as i16;
-                                k += 1;
-                            }
-                        } else if ss > 0 { // progressive AC band
-                            let ac: &HuffTable = acs[asel].as_ref().ok_or(Err::BadCover)?;
-                            let coef: &mut [i16] = comps[ci].block(col, row);
-                            if ah == 0 { ac_first(coef, &mut br, ac, ss, se, al, &mut eobrun)?; }
-                            else { ac_refine(coef, &mut br, ac, ss, se, al, &mut eobrun)?; }
-                        } else {
-                            return Err(Err::BadCover); // partial DC band — not a legal scan
-                        }
-                    }
-                }
-                unit += 1;
-            }
-        }
+        pos = run_scan(raw, pos, &mut comps, &dcs, &acs, &scan, ss, se, ah, al, dri, w, h, hmax, vmax)?;
         scans_done += 1;
-        pos = br.pos; // next marker follows the entropy stream
     }
 
     // ---- IDCT every block, then upsample and color-convert ----
@@ -488,14 +397,9 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
                 let mut px: [u8; 64] = [0; 64];
                 idct_block(&c.coefs[b..b + 64], &qt[c.tq], &cos, &mut px);
                 let d: usize = (row * 8) * c.plane_w + col * 8; // pixel row of the block's top edge
-                c.plane[d..d + 8].copy_from_slice(&px[0..8]);
-                c.plane[d + c.plane_w..d + c.plane_w + 8].copy_from_slice(&px[8..16]);
-                c.plane[d + c.plane_w * 2..d + c.plane_w * 2 + 8].copy_from_slice(&px[16..24]);
-                c.plane[d + c.plane_w * 3..d + c.plane_w * 3 + 8].copy_from_slice(&px[24..32]);
-                c.plane[d + c.plane_w * 4..d + c.plane_w * 4 + 8].copy_from_slice(&px[32..40]);
-                c.plane[d + c.plane_w * 5..d + c.plane_w * 5 + 8].copy_from_slice(&px[40..48]);
-                c.plane[d + c.plane_w * 6..d + c.plane_w * 6 + 8].copy_from_slice(&px[48..56]);
-                c.plane[d + c.plane_w * 7..d + c.plane_w * 7 + 8].copy_from_slice(&px[56..64]);
+                for r in 0..8 {
+                    c.plane[d + r * c.plane_w..d + r * c.plane_w + 8].copy_from_slice(&px[r * 8..r * 8 + 8]);
+                }
             }
         }
     }
@@ -507,13 +411,6 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
     let y: Vec<u8> = upsample(&comps[0].plane, comps[0].plane_w, comps[0].plane_h, comps[0].h, comps[0].v, hmax, vmax, w, h);
     let cb: Vec<u8> = upsample(&comps[1].plane, comps[1].plane_w, comps[1].plane_h, comps[1].h, comps[1].v, hmax, vmax, w, h);
     let cr: Vec<u8> = upsample(&comps[2].plane, comps[2].plane_w, comps[2].plane_h, comps[2].h, comps[2].v, hmax, vmax, w, h);
-    if std::env::var("DUMP_YCC").is_ok() {
-        use std::io::Write;
-        let mut f = std::fs::File::create(".private/jt/my_ycc.raw").unwrap();
-        for i in 0..w * h {
-            f.write_all(&[y[i], cb[i], cr[i]]).unwrap();
-        }
-    }
     let mut rgb: Vec<u8> = vec![0u8; w * h * 3];
     for i in 0..w * h {
         let (l, b, r): (f32, f32, f32) = (y[i] as f32, cb[i] as f32 - 128.0, cr[i] as f32 - 128.0);
@@ -522,6 +419,81 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
         rgb[i * 3 + 2] = (l + 1.772 * b).clamp(0.0, 255.0) as u8;
     }
     Ok((w, h, 3, rgb))
+}
+
+// one SOS payload: decode every block of every unit, honoring restart intervals
+#[allow(clippy::too_many_arguments)]
+fn run_scan(raw: &[u8], pos: usize, comps: &mut [Component], dcs: &[Option<HuffTable>; 4], acs: &[Option<HuffTable>; 4],
+            scan: &[usize], ss: usize, se: usize, ah: usize, al: usize, dri: usize, w: usize, h: usize,
+            hmax: usize, vmax: usize) -> Result<usize, Err> {
+    let interleaved: bool = scan.len() > 1;
+    let (ux_n, uy_n): (usize, usize) = if interleaved {
+        (w.div_ceil(hmax * 8), h.div_ceil(vmax * 8))
+    } else {
+        (comps[scan[0]].tile_x, comps[scan[0]].tile_y)
+    };
+    for &ci in scan { comps[ci].dc_pred = 0; } // predictors reset at every scan
+    let mut br: BitReader<'_> = BitReader { data: raw, pos, bits: 0, nbits: 0 };
+    let (mut rst, mut unit, mut eobrun): (u8, usize, u32) = (0, 0, 0);
+    for uy in 0..uy_n {
+        for ux in 0..ux_n {
+            if dri > 0 && unit > 0 && unit % dri == 0 {
+                br.take_restart(rst)?;
+                rst = (rst + 1) & 7;
+                for &ci in scan { comps[ci].dc_pred = 0; }
+            }
+            for &ci in scan {
+                let (bh, bv, dsel, asel): (usize, usize, usize, usize) =
+                    (comps[ci].h, comps[ci].v, comps[ci].dc_sel, comps[ci].ac_sel);
+                let blocks: Vec<(usize, usize)> = if interleaved {
+                    (0..bv).flat_map(|by| (0..bh).map(move |bx| (ux * bh + bx, uy * bv + by))).collect()
+                } else {
+                    vec![(ux, uy)]
+                };
+                for (col, row) in blocks {
+                    if ss == 0 && se == 0 { // DC-only scan
+                        if ah == 0 {
+                            let dc: &HuffTable = dcs[dsel].as_ref().ok_or(Err::BadCover)?;
+                            dc_first(&mut comps[ci], &mut br, dc, al, col, row)?;
+                        } else {
+                            dc_refine(&mut comps[ci], &mut br, al, col, row)?;
+                        }
+                    } else if ah == 0 && ss == 0 && se == 63 { // full sequential scan
+                        let dc: &HuffTable = dcs[dsel].as_ref().ok_or(Err::BadCover)?;
+                        let ac: &HuffTable = acs[asel].as_ref().ok_or(Err::BadCover)?;
+                        let t: u8 = dc.decode(&mut br)?;
+                        let diff: i32 = extend(br.receive(t as u32)?, t as u32);
+                        comps[ci].dc_pred += diff;
+                        let pred: i16 = comps[ci].dc_pred as i16;
+                        let coef: &mut [i16] = comps[ci].block(col, row);
+                        coef[0] = pred;
+                        let mut k: usize = 1;
+                        while k < 64 {
+                            let rs: u8 = ac.decode(&mut br)?;
+                            let (r, s): (usize, i32) = ((rs >> 4) as usize, (rs & 0xF) as i32);
+                            if s == 0 {
+                                if r == 15 { k += 16; continue; }
+                                break;
+                            }
+                            k += r;
+                            if k > 63 { return Err(Err::BadCover); }
+                            coef[ZIGZAG[k]] = extend(br.receive(s as u32)?, s as u32) as i16;
+                            k += 1;
+                        }
+                    } else if ss > 0 { // progressive AC band
+                        let ac: &HuffTable = acs[asel].as_ref().ok_or(Err::BadCover)?;
+                        let coef: &mut [i16] = comps[ci].block(col, row);
+                        if ah == 0 { ac_first(coef, &mut br, ac, ss, se, al, &mut eobrun)?; }
+                        else { ac_refine(coef, &mut br, ac, ss, se, al, &mut eobrun)?; }
+                    } else {
+                        return Err(Err::BadCover); // partial DC band — not a legal scan
+                    }
+                }
+            }
+            unit += 1;
+        }
+    }
+    Ok(br.pos) // next marker follows the entropy stream
 }
 
 // top-left w×h of a padded plane
@@ -534,6 +506,7 @@ fn crop(plane: &[u8], pw: usize, w: usize, h: usize) -> Vec<u8> {
 }
 
 // nearest-neighbor expansion for exotic sampling ratios
+#[allow(clippy::too_many_arguments)]
 fn upsample_plain(plane: &[u8], pw: usize, hs: usize, vs: usize, hmax: usize, vmax: usize, w: usize, oh: usize) -> Vec<u8> {
     let mut out: Vec<u8> = vec![0u8; w * oh];
     for y in 0..oh {
@@ -551,7 +524,7 @@ fn upsample_h2v1(plane: &[u8], pw: usize, w: usize, oh: usize) -> Vec<u8> {
     for y in 0..oh {
         let row = &plane[y * pw..];
         let out_row = &mut out[y * w..y * w + w];
-        for i in 0..(w + 1) / 2 {
+        for i in 0..w.div_ceil(2) {
             let cur: u32 = row[i.min(pw - 1)] as u32;
             let left: u32 = row[i.saturating_sub(1).min(pw - 1)] as u32;
             let right: u32 = row[(i + 1).min(pw - 1)] as u32;
@@ -573,8 +546,8 @@ fn upsample_h2v1(plane: &[u8], pw: usize, w: usize, oh: usize) -> Vec<u8> {
 // libjpeg h2v2 fancy: vertical 3:1 blend into column sums, then horizontal 3:1
 fn upsample_h2v2(plane: &[u8], pw: usize, ph: usize, w: usize, oh: usize) -> Vec<u8> {
     let mut out: Vec<u8> = vec![0u8; w * oh];
-    let cw: usize = (w + 1) / 2;
-    for j in 0..(oh + 1) / 2 {
+    let cw: usize = w.div_ceil(2);
+    for j in 0..oh.div_ceil(2) {
         let cur = &plane[j.min(ph - 1) * pw..];
         for dy in 0..2 {
             let orow: usize = if dy == 0 { j.saturating_sub(1).min(ph - 1) } else { (j + 1).min(ph - 1) };
@@ -597,80 +570,12 @@ fn upsample_h2v2(plane: &[u8], pw: usize, ph: usize, w: usize, oh: usize) -> Vec
 }
 
 // dispatch by sampling ratio
+#[allow(clippy::too_many_arguments)]
 fn upsample(plane: &[u8], pw: usize, ph: usize, hs: usize, vs: usize, hmax: usize, vmax: usize, w: usize, oh: usize) -> Vec<u8> {
     let (fx, fy): (usize, usize) = (hmax / hs, vmax / vs);
     match (fx, fy) {
         (2, 2) => upsample_h2v2(plane, pw, ph, w, oh),
         (2, 1) => upsample_h2v1(plane, pw, w, oh),
         _      => upsample_plain(plane, pw, hs, vs, hmax, vmax, w, oh),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn pillow_files() {
-        for f in ["base_gray", "base_color", "prog_gray", "prog_color",
-                  "pg8", "pg16", "pg32", "pg64", "pg100"] {
-            let raw: Vec<u8> = std::fs::read(format!(".private/jt/{f}.jpg")).unwrap_or_default();
-            if raw.is_empty() { continue; }
-            match super::decode(&raw) {
-                Ok((w, h, ch, _)) => println!("{f}: ok {w}x{h} ch{ch}"),
-                Err(e) => println!("{f}: ERR {e:?}"),
-            }
-        }
-    }
-
-
-    #[test]
-    fn fixtures() {
-        for (p, wh) in [("tests/fixtures/big.jpg", (1600, 1200)), ("tests/fixtures/tiny.jpg", (400, 400))] {
-            let raw: Vec<u8> = std::fs::read(p).unwrap();
-            match super::decode(&raw) {
-                Ok((w, h, ch, _)) => assert_eq!((w, h, ch), (wh.0, wh.1, 3)),
-                Err(e) => panic!("{p}: {e:?}"),
-            }
-        }
-    }
-
-    fn base_or_big() -> bool { std::env::var("USE_BIG").is_ok() || std::env::var("USE_BASE").is_ok() }
-
-    #[test]
-    fn pixel_accuracy_vs_pillow() {
-        // 4:4:4 so upsampling differences cannot mask decode errors; USE_BASE=1
-        // swaps in a baseline JPEG and USE_GRAY=1 a grayscale one, to isolate
-        // sequential-vs-progressive and color-conversion bugs
-        let (jpg, rawf, ch_exp): (&str, &str, usize) = if std::env::var("USE_BIG").is_ok() {
-            ("tests/fixtures/big.jpg", ".private/jt/big.raw", 3)
-        } else if std::env::var("USE_FLAT").is_ok() {
-            (".private/jt/flat.jpg", ".private/jt/flat.raw", 1)
-        } else if std::env::var("USE_GRAY").is_ok() {
-            (".private/jt/g444.jpg", ".private/jt/g444.raw", 1)
-        } else if std::env::var("USE_SMOOTH").is_ok() {
-            (".private/jt/smooth420.jpg", ".private/jt/smooth420.raw", 3)
-        } else if std::env::var("USE_BASE").is_ok() {
-            (".private/jt/b444.jpg", ".private/jt/b444.raw", 3)
-        } else {
-            (".private/jt/p444.jpg", ".private/jt/p444.raw", 3)
-        };
-        let raw: Vec<u8> = std::fs::read(jpg).unwrap_or_default();
-        if raw.is_empty() { return; }
-        let ref_rgb: Vec<u8> = std::fs::read(rawf).unwrap();
-        let (w, h, ch, px) = super::decode(&raw).unwrap();
-        let (ew, eh): (usize, usize) = if base_or_big() { (1600, 1200) } else { (100, 80) };
-        assert_eq!((w, h, ch), (ew, eh, ch_exp));
-        let n: usize = px.len() / ch;
-        let total: u64 = px.iter().zip(ref_rgb.iter()).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64).sum();
-        println!("mean abs diff vs pillow: {:.3}", total as f64 / px.len() as f64);
-        if ch == 3 {
-            for c in 0..3 {
-                let ctotal: u64 = (0..n).map(|i| (px[i * 3 + c] as i32 - ref_rgb[i * 3 + c] as i32).unsigned_abs() as u64).sum();
-                println!("channel {c} mean abs diff: {:.3}", ctotal as f64 / n as f64);
-            }
-        }
-        // uniform-random noise stresses the IDCT far more than real content; the
-        // residual there is Pillow's own integer-IDCT rounding, not our error
-        let limit: f64 = if std::env::var("USE_BIG").is_ok() || std::env::var("USE_SMOOTH").is_ok() { 2.0 } else { 6.0 };
-        assert!(total as f64 / (px.len() as f64) < limit, "decoder diverges from reference");
     }
 }
