@@ -1,12 +1,29 @@
 """decryptune — fast, native M4A/CENC decryptor + MP4 sanitizer + iTunes tagger.
 
-Wheel distribution: the native extension ships INSIDE this package and is
-fixed at install time — no paths, nothing to swap. For the standalone
-workflow (extension file + path) use the decryptune.py wrapper from the source
-tree. Keep this file in sync with it (same API surface, loader differs).
+The native extension ships INSIDE the wheel and is fixed at install time —
+no paths, nothing to swap. From a source checkout (no bundled binary) the
+package falls back to the staged extension beside the repo root.
 """
 
-from . import decryptune as _native
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+
+try:
+    from . import decryptune as _native
+except ImportError:
+    # source checkout: load the staged extension from the repo root (or beside
+    # the package); the loader requires PyInit_decryptune, so the module keeps
+    # that name
+    _pkg = Path(__file__).resolve().parent
+    _candidates = [base / n for base in (_pkg.parent.parent, _pkg.parent, _pkg) for n in
+                   ("libdecryptune.so", "libdecryptune.dylib", "decryptune.pyd")]
+    _lib = next((p for p in _candidates if p.exists()), None)
+    if _lib is None:
+        raise
+    _loader = importlib.machinery.ExtensionFileLoader("decryptune", str(_lib))
+    _native = importlib.util.module_from_spec(importlib.util.spec_from_loader("decryptune", _loader))
+    _loader.exec_module(_native)
 
 __version__ = "1.1.2"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
@@ -43,9 +60,9 @@ def _to_err(exc: Exception) -> DecrypTuneError | None:
 
 
 class DecrypTune:
-    """Interface to the decryptune native extension bundled in this wheel.
+    """Interface to the decryptune native extension.
 
-    The native module is fixed at install time — DecrypTune takes no path.
+    The native module is fixed at import time — DecrypTune takes no path.
     """
 
     __slots__ = ("_lib",)

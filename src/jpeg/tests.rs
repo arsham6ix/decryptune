@@ -1,14 +1,22 @@
-// JPEG codec tests. Decode accuracy runs against Pillow ground truth in
-// .private/jt/ (env-switched fixtures); encode is validated by self-roundtrip
-// plus a Pillow-decodable dump checked from .private/enc_check.py.
+// JPEG codec tests. Fixture-dependent tests read from the directory named by
+// the JPEG_FIXTURES env var (generated locally, never shipped — the public
+// source carries no private paths) and skip silently when it is unset; the
+// pixel test compares against Pillow ground truth saved there as raw RGB.
+// The encoder is validated by self-roundtrip plus a Pillow-decodable dump.
 
 use crate::jpeg::{decode, encode};
 
+// fixture path inside the JPEG_FIXTURES directory — None → tests skip
+fn jt(name: &str) -> Option<String> {
+    std::env::var("JPEG_FIXTURES").ok().map(|d| format!("{d}/{name}"))
+}
+
 #[test]
 fn pillow_files() {
+    let Some(dir) = std::env::var("JPEG_FIXTURES").ok() else { return };
     for f in ["base_gray", "base_color", "prog_gray", "prog_color",
               "pg8", "pg16", "pg32", "pg64", "pg100"] {
-        let raw: Vec<u8> = std::fs::read(format!(".private/jt/{f}.jpg")).unwrap_or_default();
+        let raw: Vec<u8> = std::fs::read(format!("{dir}/{f}.jpg")).unwrap_or_default();
         if raw.is_empty() { continue; }
         match decode(&raw) {
             Ok((w, h, ch, _)) => println!("{f}: ok {w}x{h} ch{ch}"),
@@ -35,23 +43,22 @@ fn pixel_accuracy_vs_pillow() {
     // 4:4:4 so upsampling differences cannot mask decode errors; USE_BASE=1
     // swaps in a baseline JPEG and USE_GRAY=1 a grayscale one, to isolate
     // sequential-vs-progressive and color-conversion bugs
-    let (jpg, rawf, ch_exp): (&str, &str, usize) = if std::env::var("USE_BIG").is_ok() {
-        ("tests/fixtures/big.jpg", ".private/jt/big.raw", 3)
+    let (jpg, rawf, ch_exp): (Option<String>, Option<String>, usize) = if std::env::var("USE_BIG").is_ok() {
+        (Some("tests/fixtures/big.jpg".into()), jt("big.raw"), 3)
     } else if std::env::var("USE_FLAT").is_ok() {
-        (".private/jt/flat.jpg", ".private/jt/flat.raw", 1)
+        (jt("flat.jpg"), jt("flat.raw"), 1)
     } else if std::env::var("USE_GRAY").is_ok() {
-        (".private/jt/g444.jpg", ".private/jt/g444.raw", 1)
+        (jt("g444.jpg"), jt("g444.raw"), 1)
     } else if std::env::var("USE_SMOOTH").is_ok() {
-        (".private/jt/smooth420.jpg", ".private/jt/smooth420.raw", 3)
+        (jt("smooth420.jpg"), jt("smooth420.raw"), 3)
     } else if std::env::var("USE_BASE").is_ok() {
-        (".private/jt/b444.jpg", ".private/jt/b444.raw", 3)
+        (jt("b444.jpg"), jt("b444.raw"), 3)
     } else {
-        (".private/jt/p444.jpg", ".private/jt/p444.raw", 3)
+        (jt("p444.jpg"), jt("p444.raw"), 3)
     };
-    let raw: Vec<u8> = std::fs::read(jpg).unwrap_or_default();
-    if raw.is_empty() { return; }
-    let ref_rgb: Vec<u8> = std::fs::read(rawf).unwrap();
-    let (w, h, ch, px) = decode(&raw).unwrap();
+    let (Some(jpg), Some(rawf)) = (jpg, rawf) else { return };
+    let ref_rgb: Vec<u8> = std::fs::read(&rawf).unwrap();
+    let (w, h, ch, px) = decode(&std::fs::read(&jpg).unwrap()).unwrap();
     let (ew, eh): (usize, usize) = if base_or_big() { (1600, 1200) } else { (100, 80) };
     assert_eq!((w, h, ch), (ew, eh, ch_exp));
     let n: usize = px.len() / ch;
@@ -109,13 +116,14 @@ fn encode_edge_blocks() {
     assert_eq!((dw, dh, dch), (w, h, 3));
 }
 
-// DUMP_ENC=1: write our encode of the p444 reference so .private/enc_check.py
-// can measure PSNR against the source via Pillow
+// DUMP_ENC=1 + JPEG_FIXTURES: write our encode of the p444 reference so the
+// local Pillow PSNR checker can score it against the same pristine source
 #[test]
 fn dump_encoded_for_pillow() {
     if std::env::var("DUMP_ENC").is_err() { return; }
-    let raw: Vec<u8> = std::fs::read(".private/jt/p444.raw").unwrap_or_default();
+    let Some(rawf) = jt("p444.raw") else { return };
+    let raw: Vec<u8> = std::fs::read(&rawf).unwrap_or_default();
     if raw.is_empty() { return; }
     let jpg: Vec<u8> = encode(&raw, 100, 80, 3).unwrap();
-    std::fs::write(".private/jt/enc_out.jpg", &jpg).unwrap();
+    std::fs::write(jt("enc_out.jpg").unwrap(), &jpg).unwrap();
 }

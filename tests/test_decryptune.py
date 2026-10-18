@@ -9,7 +9,6 @@ Run:  python3 -m pytest tests/
 """
 
 import asyncio
-import importlib.util
 import os
 import random
 import struct
@@ -22,15 +21,13 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 if os.environ.get("DECRYPTUNE_WHEEL"):
     # installed wheel: import from site-packages — strip cwd so a same-named
-    # standalone wrapper file in the repo cannot shadow the package
+    # file in the repo cannot shadow the package
     sys.path[:] = [p for p in sys.path if os.path.realpath(p or os.getcwd()) != os.getcwd()]
     from decryptune import DecrypTune, DecrypTuneError, TuneMeta
 else:
-    # repo checkout: the standalone wrapper + the extension file by path
-    _spec = importlib.util.spec_from_file_location("decryptune_wrapper", os.path.join(_ROOT, "decryptune.py"))
-    _wrapper = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_wrapper)
-    DecrypTune, DecrypTuneError, TuneMeta = _wrapper.DecrypTune, _wrapper.DecrypTuneError, _wrapper.TuneMeta
+    # repo checkout: the wheel package with its staged-extension fallback
+    sys.path.insert(0, os.path.join(_ROOT, "python"))
+    from decryptune import DecrypTune, DecrypTuneError, TuneMeta
 
 KEY_HEX = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 KEY = bytes.fromhex(KEY_HEX)
@@ -324,7 +321,7 @@ def assert_decrypted(out, expected_plain):
 
 @pytest.fixture(scope="session")
 def sp():
-    return DecrypTune() if os.environ.get("DECRYPTUNE_WHEEL") else DecrypTune(os.path.join(_ROOT, "libdecryptune.so"))
+    return DecrypTune()
 
 
 @pytest.fixture(scope="session")

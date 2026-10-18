@@ -8,16 +8,13 @@ Fast, native M4A (fMP4/CENC) decryptor + MP4 sanitizer + iTunes tagger in one li
 pip install decryptune
 ```
 
-**Standalone (no install)** — keep `decryptune.py` next to the extension binary and pass its path: `DecrypTune("./libdecryptune.so")`
-
-From source (needs Rust 1.85+ and Python 3.12+): `pip install maturin && maturin build --release` — this is also the macOS path (it builds and runs the same; prebuilt wheels and zips ship for Linux and Windows).
+From source (needs Rust 1.85+ and Python 3.12+): `pip install maturin && maturin build --release` — this is also the macOS path (it builds and runs the same; prebuilt wheels ship for Linux and Windows).
 
 ## Usage
 
 ```python
 from decryptune import DecrypTune, TuneMeta
 
-# bundled native module (wheel) — or DecrypTune("./libdecryptune.so")
 sp = DecrypTune()
 
 sp.proc(
