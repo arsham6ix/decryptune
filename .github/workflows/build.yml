@@ -53,12 +53,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: develop
-      - run: python3 -m pip install pytest pycryptodome mutagen
+      # maturin develop needs a virtualenv — the runner's python is system-wide
+      - run: python3 -m venv .venv
+      - run: .venv/bin/pip install maturin pytest pycryptodome mutagen
+      - run: .venv/bin/maturin develop
       # the checkout has no staged extension — test the installed wheel
-      - run: DECRYPTUNE_WHEEL=1 python3 -m pytest tests/ -q
+      - run: DECRYPTUNE_WHEEL=1 .venv/bin/python -m pytest tests/ -q
       - run: cargo test --release
 
   # abi3 wheels: linux + windows (manylinux_2_28 for the widest glibc coverage)
