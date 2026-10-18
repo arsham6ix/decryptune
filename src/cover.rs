@@ -1,9 +1,9 @@
 // Cover prep: oversized JPEGs → area-average downscale to 1000px, q90 re-encode;
 // fitting covers and PNGs pass through byte-identical (minimal deps, no `image` crate)
 
-use jpeg_decoder::{Decoder, ImageInfo, PixelFormat};
 use jpeg_encoder::{Encoder, ColorType};
 
+use crate::jpeg;
 use crate::meta::Cover;
 use crate::Err;
 
@@ -21,29 +21,14 @@ pub(crate) fn prepare(raw: &[u8]) -> Result<Cover, Err> {
         return Err(Err::BadCover);
     }
 
-    let mut decoder: Decoder<&[u8]> = Decoder::new(raw);
-    let pixels: Vec<u8> = decoder.decode().map_err(|_| Err::BadCover)?;
-    let info: ImageInfo = decoder.info().ok_or(Err::BadCover)?;
-    let (w, h): (u32, u32) = (info.width as u32, info.height as u32);
-    if w == 0 || h == 0 { return Err(Err::BadCover); }
-
-    // already fits — the original bytes pass through untouched
-    if w <= MAX_EDGE && h <= MAX_EDGE {
-        return Ok(Cover { data: raw.to_vec(), kind: 13 });
+    let (w, h, ch, pixels): (usize, usize, usize, Vec<u8>) = jpeg::decode(raw)?;
+    if w <= MAX_EDGE as usize && h <= MAX_EDGE as usize {
+        return Ok(Cover { data: raw.to_vec(), kind: 13 }); // fits — original bytes untouched
     }
-
-    let (nw, nh): (u32, u32) = fit(w, h, MAX_EDGE);
-    match info.pixel_format {
-        PixelFormat::L8 => {
-            let scaled = resize_area(&pixels, w, h, 1, nw, nh);
-            Ok(Cover { data: encode_jpeg(&scaled, nw, nh, ColorType::Luma)?, kind: 13 })
-        }
-        PixelFormat::RGB24 => {
-            let scaled = resize_area(&pixels, w, h, 3, nw, nh);
-            Ok(Cover { data: encode_jpeg(&scaled, nw, nh, ColorType::Rgb)?, kind: 13 })
-        }
-        _ => Err(Err::BadCover), // CMYK covers are beyond scope
-    }
+    let (nw, nh): (u32, u32) = fit(w as u32, h as u32, MAX_EDGE);
+    let scaled: Vec<u8> = resize_area(&pixels, w as u32, h as u32, ch, nw, nh);
+    let color: ColorType = if ch == 1 { ColorType::Luma } else { ColorType::Rgb };
+    Ok(Cover { data: encode_jpeg(&scaled, nw, nh, color)?, kind: 13 })
 }
 
 /// Longest-edge fit: (nw, nh) ≤ max_edge preserving aspect ratio.

@@ -159,13 +159,25 @@ fn visit_moof(out: &mut Vec<u8>, data: &[u8], b: &Box) -> Plan {
     Plan { ivs, sizes, default: default_size, ok, rebuilt_len: content.len() + 8 }
 }
 
+// 16 sub-histograms break the same-bucket increment dependency chain (16
+// independent chains instead of one) — the scalar loop was the whole strict cost
+const CHI2_LANES: usize = 16;
+
 fn chi2(buf: &[u8]) -> f64 {
     let n: usize = buf.len();
     if n == 0 { return 0.0; }
-    let mut hist: [u64; 256] = [0u64; 256];
-    for &b in buf { hist[b as usize] += 1; }
+    let mut hist: [[u64; 256]; CHI2_LANES] = [[0u64; 256]; CHI2_LANES];
+    let (body, tail): (&[u8], &[u8]) = buf.split_at(buf.len() & !(CHI2_LANES - 1));
+    for c in body.chunks_exact(CHI2_LANES) {
+        for (l, &b) in c.iter().enumerate() { hist[l][b as usize] += 1; }
+    }
+    for &b in tail { hist[0][b as usize] += 1; }
+    let mut total: [u64; 256] = [0u64; 256];
+    for lane in &hist {
+        for (t, &o) in total.iter_mut().zip(lane.iter()) { *t += o; }
+    }
     let e: f64 = n as f64 / 256.0;
-    hist.iter().map(|&o| { let d: f64 = o as f64 - e; d * d / e }).sum()
+    total.iter().map(|&o| { let d: f64 = o as f64 - e; d * d / e }).sum()
 }
 
 fn emit_mdat(

@@ -1,5 +1,6 @@
 mod boxes;
 mod cover;
+mod jpeg;
 mod meta;
 mod process;
 
@@ -10,22 +11,39 @@ use pyo3::types::{PyByteArray, PyBytes, PyString};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 enum Input {
-    Bytes(Vec<u8>),
+    Owned(Vec<u8>),
+    // PyBytes is immutable, so borrowing its buffer across a GIL release is
+    // sound: the Py<> owner pins the object alive and nothing can change it
+    // (the owner field is intentionally never read — it only anchors the slice)
+    Borrowed(#[allow(dead_code)] Py<PyBytes>, &'static [u8]),
     Path(String)
+}
+
+enum InputData {
+    // the owner is never read — it only anchors the borrowed slice
+    Owned(Vec<u8>),
+    Borrowed(#[allow(dead_code)] Py<PyBytes>, &'static [u8])
+}
+
+impl InputData {
+    fn bytes(&self) -> &[u8] {
+        match self { InputData::Owned(v) => v, InputData::Borrowed(_, s) => s }
+    }
+}
+
+impl Input {
+    fn load(self) -> Result<InputData, Err> {
+        Ok(match self {
+            Input::Owned(v)       => InputData::Owned(v),
+            Input::Borrowed(o, s) => InputData::Borrowed(o, s),
+            Input::Path(p)        => InputData::Owned(std::fs::read(&p).map_err(|_| Err::InputNotFound)?)
+        })
+    }
 }
 
 enum Output {
     Path(String),
     Return
-}
-
-impl Input {
-    fn load(self) -> Result<Vec<u8>, Err> {
-        match self {
-            Input::Bytes(b) => Ok(b),
-            Input::Path(p)  => std::fs::read(&p).map_err(|_| Err::InputNotFound)
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,14 +133,20 @@ fn write_atomic(out_path: &str, data: &[u8]) -> Result<(), Err> {
 // the shared bytes/path dispatch: bytes | bytearray | str path | __fspath__ | memoryview
 enum Extracted {
     Bytes(Vec<u8>),
+    Borrowed(Py<PyBytes>, &'static [u8]),
     Path(String)
 }
 
 fn extract_bytes_or_path(value: &Bound<'_, PyAny>, bad: Err) -> PyResult<Extracted> {
     Ok(if let Ok(b) = value.cast::<PyBytes>() {
-        Extracted::Bytes(b.as_bytes().to_vec())
+        // immutable bytes — pin the object and borrow its buffer instead of
+        // copying; from_raw_parts re-lifetimes the slice, sound because the
+        // Py<> owner stored beside it outlives every use of the slice
+        let owner: Py<PyBytes> = b.clone().unbind();
+        let s: &[u8] = b.as_bytes();
+        Extracted::Borrowed(owner, unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len()) })
     } else if let Ok(b) = value.cast::<PyByteArray>() {
-        Extracted::Bytes(b.to_vec())
+        Extracted::Bytes(b.to_vec()) // mutable — a copy is mandatory
     } else if let Ok(s) = value.cast::<PyString>() {
         Extracted::Path(s.to_str()?.to_string())
     } else if let Ok(p) = value.call_method0("__fspath__") { // os.PathLike
@@ -149,8 +173,9 @@ fn extract_bytes_or_path(value: &Bound<'_, PyAny>, bad: Err) -> PyResult<Extract
 
 fn parse_input(value: &Bound<'_, PyAny>) -> PyResult<Input> {
     Ok(match extract_bytes_or_path(value, Err::BadInput)? {
-        Extracted::Bytes(b) => Input::Bytes(b),
-        Extracted::Path(p)  => Input::Path(p)
+        Extracted::Bytes(b)          => Input::Owned(b),
+        Extracted::Borrowed(o, s)    => Input::Borrowed(o, s),
+        Extracted::Path(p)           => Input::Path(p)
     })
 }
 
@@ -208,9 +233,9 @@ fn finish(processed: process::Processed, output: Output, key: Option<[u8; 16]>, 
 
 // shared head: load input, guard kid, run the fused pass
 fn run(input: Input, key: Option<[u8; 16]>, kid: Option<String>, meta: Option<meta::CoreMeta>, strict: bool) -> Result<process::Processed, Err> {
-    let data: Vec<u8> = input.load()?;
-    if key.is_some() { guard_kid(&data, kid.as_deref())?; } // kid without key is meaningless
-    process::process(&data, key.as_ref(), strict, meta.as_ref())
+    let data: InputData = input.load()?;
+    if key.is_some() { guard_kid(data.bytes(), kid.as_deref())?; } // kid without key is meaningless
+    process::process(data.bytes(), key.as_ref(), strict, meta.as_ref())
 }
 
 #[pyclass]
@@ -278,8 +303,10 @@ fn resolve_meta(py: Python<'_>, meta: Option<&TuneMeta>) -> PyResult<Option<meta
     let cover: Option<meta::RawCover> = match &m.cover {
         None      => None,
         Some(obj) => Some(match extract_bytes_or_path(obj.bind(py), Err::BadCover)? {
-            Extracted::Bytes(b) => meta::RawCover::Bytes(b),
-            Extracted::Path(p)  => meta::RawCover::Path(p)
+            Extracted::Bytes(b)       => meta::RawCover::Bytes(b),
+            // covers are small (≤1MB) — a copy here keeps RawCover simple
+            Extracted::Borrowed(_, s) => meta::RawCover::Bytes(s.to_vec()),
+            Extracted::Path(p)        => meta::RawCover::Path(p)
         })
     };
     let non_zero: fn(Option<u32>) -> Option<u32> = |v| v.filter(|n| *n > 0);
