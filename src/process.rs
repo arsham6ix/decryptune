@@ -65,8 +65,15 @@ pub fn process(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&
             b"moov" => {
                 let children: Vec<u8> = rebuild_container(data, b.content_start, b.end, 0);
                 let children: Vec<u8> = if let Some(m) = meta {
-                    // growing moov dangles absolute chunk offsets — fragmented files carry empty stco
-                    if has_chunk_offsets(&children, 0) { return Err(Err::MetaNeedsFragmented); }
+                    // chunk offsets point into mdat — growing moov breaks them only
+                    // when an mdat sits after moov or an earlier moof rebuild shifted
+                    // the data; in the moov-at-end layout the write is safe even
+                    // with a non-empty stco
+                    let mdat_after: bool = boxes[i + 1..].iter().any(|x| x.is(b"mdat"));
+                    let shifted: bool = deltas.iter().any(|d| *d != 0);
+                    if has_chunk_offsets(&children, 0) && (mdat_after || shifted) {
+                        return Err(Err::MetaNeedsFragmented);
+                    }
                     rebuild_moov_with_meta(&children, m)?
                 } else {
                     children

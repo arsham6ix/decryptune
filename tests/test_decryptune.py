@@ -452,12 +452,24 @@ def test_aproc_out_is_directory_no_tmp_litter(sp, src_file, tmp_path):
 
 
 def test_error_tags_need_fragmented(sp):
-    # a non-empty stco dangles once moov grows with tags -> refused
+    # stco offsets point into the mdat AFTER moov — growing moov dangles them
     stco = full_box(b"stco", 0, 0, u32(1) + u32(100))
-    stco_file = box(b"moov", box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stco)))))
+    moov = box(b"moov", box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stco)))))
+    stco_file = box(b"ftyp", b"M4A isom") + moov + box(b"mdat", b"x" * 64)
     with pytest.raises(DecrypTuneError) as e:
         sp.proc(input=stco_file, meta=TuneMeta(title="X"))
     assert e.value.code == 11
+
+
+def test_meta_mdat_before_moov(sp):
+    # moov-at-end layout: chunk offsets point backward into mdat, so growing
+    # moov shifts nothing they reference — tags must land despite a non-empty stco
+    stco = full_box(b"stco", 0, 0, u32(1) + u32(24))
+    moov = box(b"moov", box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stco)))))
+    plain_file = box(b"ftyp", b"M4A isom") + box(b"mdat", bytes(16)) + moov
+    out = sp.proc(input=plain_file, meta=TuneMeta(title="Tail"))
+    items = ilst_items(out)
+    assert data_payload(items[b"\xa9nam"][0]) == b"Tail"
 
 
 # ---- proc -------------------------------------------------------------------
