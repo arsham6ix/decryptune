@@ -14,10 +14,14 @@ try:
 except ImportError:
     # source checkout: load the staged extension from the repo root (or beside
     # the package); the loader requires PyInit_decryptune, so the module keeps
-    # that name
+    # that name. The candidate order is platform-aware — the repo may stage
+    # builds for several platforms side by side.
+    import sys
+
+    _names: tuple[str, ...] = ("decryptune.pyd",) if sys.platform == "win32" else \
+        ("libdecryptune.dylib",) if sys.platform == "darwin" else ("libdecryptune.so",)
     _pkg = Path(__file__).resolve().parent
-    _candidates = [base / n for base in (_pkg.parent.parent, _pkg.parent, _pkg) for n in
-                   ("libdecryptune.so", "libdecryptune.dylib", "decryptune.pyd")]
+    _candidates = [base / n for base in (_pkg.parent.parent, _pkg.parent, _pkg) for n in _names]
     _lib = next((p for p in _candidates if p.exists()), None)
     if _lib is None:
         raise

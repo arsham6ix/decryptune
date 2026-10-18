@@ -150,15 +150,20 @@ fn scale_qt(base: &[u16; 64]) -> [u16; 64] {
     t
 }
 
-// BT.601 YCbCr, full range (JFIF)
+// round-half-away-from-zero without touching libm — baseline x86-64 has no
+// SSE4.1 roundss, so f32::round would become a libm call per pixel
+#[inline]
+fn round(v: f32) -> i32 { (v + 0.5f32.copysign(v)) as i32 }
+
+// BT.601 YCbCr, full range (JFIF); float→int `as` casts saturate into 0..255
 fn rgb_to_ycc(rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let n: usize = w * h;
     let (mut y, mut cb, mut cr): (Vec<u8>, Vec<u8>, Vec<u8>) = (vec![0; n], vec![0; n], vec![0; n]);
     for i in 0..n {
         let (r, g, b): (f32, f32, f32) = (rgb[i * 3] as f32, rgb[i * 3 + 1] as f32, rgb[i * 3 + 2] as f32);
-        y[i]  = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
-        cb[i] = (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0).round().clamp(0.0, 255.0) as u8;
-        cr[i] = (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0).round().clamp(0.0, 255.0) as u8;
+        y[i]  = round(0.299 * r + 0.587 * g + 0.114 * b) as u8;
+        cb[i] = round(-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0) as u8;
+        cr[i] = round(0.5 * r - 0.418688 * g - 0.081312 * b + 128.0) as u8;
     }
     (y, cb, cr)
 }
@@ -181,14 +186,14 @@ fn fdct_block(px: &[u8; 64], cos: &[[f32; 8]; 8], out: &mut [i16; 64]) {
         for u in 0..8 {
             let mut s: f32 = 0.0;
             for y in 0..8 { s += g[y][u] * cos[v][y]; }
-            out[v * 8 + u] = s.round() as i16;
+            out[v * 8 + u] = round(s) as i16;
         }
     }
 }
 
 fn quantize(coef: &mut [i16; 64], qt: &[u16; 64]) {
     for p in 0..64 {
-        coef[p] = (coef[p] as f32 / qt[p] as f32).round() as i16;
+        coef[p] = round(coef[p] as f32 / qt[p] as f32) as i16;
     }
 }
 

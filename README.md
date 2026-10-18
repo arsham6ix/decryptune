@@ -47,16 +47,18 @@ Rules that hold for both `proc` and `aproc`:
 
 ## Benchmark
 
-Real 3.0MB fragmented track + synthetic fragmented files, Intel i7-11800H (8C/16T), WSL2:
+Native Windows 11 (windows-x86_64 wheel), Intel i7-11800H (8C/16T), Python 3.13, real 3.0MB fragmented track:
 
 | scenario | result |
 |---|---|
-| decrypt + fix, strict (3.0MB, bytes in/out) | 2.4 ms median |
-| fix-only pass (no key, 3.0MB) | 0.3 ms |
-| full tags + cover resize (877KB JPEG) | 208 ms |
-| 32 calls: sequential → `asyncio.gather` | 79 ms → 24 ms (**×3.3**) |
-| 128MB file: fix-only / decrypt / decrypt+strict | 60 / 70 / 101 ms (fragment work spread across cores) |
-| event-loop max lag under 8 concurrent heavy calls | < 4 ms |
+| decrypt + fix, strict (bytes in/out) | 3.0 ms median — ~1.0 GB/s |
+| fix-only pass (no key) | 1.0 ms |
+| full tags + cover resize (877KB JPEG) | 219 ms |
+| 32 calls: sequential → `asyncio.gather` (bytes) | 97 ms → 30 ms (**×3.3**) |
+| 32 calls with path out (real writes) | 46 ms (**×2.1**) |
+| event-loop max lag under 8 concurrent heavy calls | < 15 ms (Windows timer granularity) |
+
+Fragment work (decrypt + strict evidence check) spreads across cores on large files: a 128MB fragmented file runs decrypt+strict in ~0.1s.
 
 ## License
 

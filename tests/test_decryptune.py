@@ -13,6 +13,7 @@ import os
 import random
 import struct
 import sys
+import time
 
 import pytest
 from Crypto.Cipher import AES
@@ -592,6 +593,11 @@ def test_aproc_cancel_no_tmp_litter(sp, src_file, tmp_path):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(main())
+    # a dropped future does not abort its spawn_blocking write — give the
+    # workers a moment to finish their renames before auditing for litter
+    deadline: float = time.time() + 5
+    while time.time() < deadline and list(tmp_path.glob("*.tmp")):
+        time.sleep(0.05)
     assert list(tmp_path.glob("*.tmp")) == []
 
 
