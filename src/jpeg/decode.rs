@@ -5,6 +5,11 @@
 use super::ZIGZAG;
 use crate::Err;
 
+// hostile SOF dimensions can demand multi-GB coefficient buffers before any
+// entropy byte is read — no real cover comes close (a 150MP medium-format
+// shot sits 2x under this); anything above is a decompression bomb
+const MAX_PIXELS: usize = 268_435_456; // 256 megapixels
+
 struct HuffTable {
     counts    : [u8; 17],   // symbols per code length 1..=16
     first_code: [u16; 17],
@@ -310,7 +315,7 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
                     h = u16::from_be_bytes([raw[pos + 3], raw[pos + 4]]) as usize;
                     w = u16::from_be_bytes([raw[pos + 5], raw[pos + 6]]) as usize;
                     let nc: usize = raw[pos + 7] as usize;
-                    if w == 0 || h == 0 || (nc != 1 && nc != 3) || seg != 8 + nc * 3 { return Err(Err::BadCover); }
+                    if w == 0 || h == 0 || w * h > MAX_PIXELS || (nc != 1 && nc != 3) || seg != 8 + nc * 3 { return Err(Err::BadCover); }
                     comps.clear();
                     for c in 0..nc {
                         let b: usize = pos + 8 + c * 3;

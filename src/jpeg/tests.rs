@@ -116,6 +116,15 @@ fn encode_edge_blocks() {
     assert_eq!((dw, dh, dch), (w, h, 3));
 }
 
+#[test]
+fn hostile_huge_sof_rejected() {
+    // a 65535x65535 SOF claim must fail validation before any buffer is
+    // allocated — without the pixel cap this tries to reserve ~8GB
+    let sof: [u8; 11] = [0, 11, 8, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0x11, 0];
+    let jpg: Vec<u8> = [&[0xFF, 0xD8, 0xFF, 0xC0][..], &sof, &[0xFF, 0xD9][..]].concat();
+    assert!(decode(&jpg).is_err());
+}
+
 // DUMP_ENC=1 + JPEG_FIXTURES: write our encode of the p444 reference so the
 // local Pillow PSNR checker can score it against the same pristine source
 #[test]
