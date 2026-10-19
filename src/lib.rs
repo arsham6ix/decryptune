@@ -10,6 +10,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use error::Err;
@@ -43,21 +44,24 @@ fn tmp_path(out_path: &str) -> String {
     format!("{}.{}.{}.tmp", out_path, std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
-// write to <out>.<n>.tmp then rename — no partial outputs on crash;
-// a failed rename removes the tmp file (no litter in the output directory)
+// write to <out>.<n>.tmp then rename — no partial outputs on crash.
+// create_new (O_CREAT|O_EXCL) refuses a symlink pre-placed at the predictable
+// tmp name and fails on collision instead of clobbering an existing file
 fn write_atomic(out_path: &str, data: &[u8]) -> Result<(), Err> {
     let tmp: String = tmp_path(out_path);
-    std::fs::write(&tmp, data).map_err(|_| Err::WriteFailed)?;
-    if std::fs::rename(&tmp, out_path).is_err() {
+    let mut file: std::fs::File = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        .map_err(|_| Err::WriteFailed)?;
+    if file.write_all(data).is_err() || std::fs::rename(&tmp, out_path).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return Err(Err::WriteFailed);
     }
     Ok(())
 }
 
-// strict evidence check, shared by the sync and async tails
-fn check_strict(fragments: &[process::FragmentStat], key: Option<[u8; 16]>, strict: bool) -> PyResult<()> {
-    if strict && key.is_some() {
+// strict evidence check, shared by the sync and async tails; `guarded` is
+// precomputed (strict && key given) because the key copy dies in its worker
+fn check_strict(fragments: &[process::FragmentStat], guarded: bool) -> PyResult<()> {
+    if guarded {
         let bad_frags: Vec<String> = fragments.iter()
             .filter(|f| f.corrupt == Some(true))
             .map(|f| format!("#{} chi2={:.0} ({}B)", f.index, f.chi2, f.bytes))
@@ -72,13 +76,22 @@ fn check_strict(fragments: &[process::FragmentStat], key: Option<[u8; 16]>, stri
     Ok(())
 }
 
+// best-effort key hygiene: volatile writes defeat dead-store elimination so
+// the worker's AES key copy is cleared instead of lingering in freed memory
+fn wipe_key(key: &mut Option<[u8; 16]>) {
+    if let Some(k) = key.as_mut() {
+        for b in k.iter_mut() { unsafe { std::ptr::write_volatile(b, 0u8); } }
+    }
+}
+
 // pass 1, shared by proc/aproc: load input, guard kid, measure the exact
 // output length — all off the GIL; the loaded data and the metadata must
-// survive to pass 2, so the metadata comes back out
-fn load_and_measure(input: input::Input, key: Option<[u8; 16]>, kid: Option<String>, meta: Option<meta::CoreMeta>)
+// survive to pass 2, so the metadata comes back out. Only `has_key` crosses
+// here — the key itself never needs to reach the measure phase
+fn load_and_measure(input: input::Input, has_key: bool, kid: Option<String>, meta: Option<meta::CoreMeta>)
     -> Result<(InputData, usize, Option<meta::CoreMeta>), Err> {
     let d: InputData = input.load()?;
-    if key.is_some() { guard_kid(d.bytes(), kid.as_deref())?; }
+    if has_key { guard_kid(d.bytes(), kid.as_deref())?; }
     let mut meta = meta;
     if let Some(m) = meta.as_mut() { meta::pre_resolve_cover(m)?; } // cover codec work once
     let len: usize = process::measure(d.bytes(), meta.as_ref())?;
@@ -220,15 +233,18 @@ fn proc<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     let Args { input, output, key, kid, core_meta }: Args = parse_args(py, input, out, key, kid, meta)?;
     let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) =
-        py.detach(move || load_and_measure(input, key, kid, core_meta)).map_err(PyErr::from)?;
+        py.detach(move || load_and_measure(input, key.is_some(), kid, core_meta)).map_err(PyErr::from)?;
+    let guarded: bool = strict && key.is_some();
 
     match output {
         Output::Path(p) => {
             py.detach(move || -> PyResult<()> {
+                let mut key: Option<[u8; 16]> = key;
                 let mut buf: Vec<u8> = vec![0u8; len]; // exact-size output, no over-allocation
                 let fragments: Vec<process::FragmentStat> =
                     process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
-                check_strict(&fragments, key, strict)?;
+                wipe_key(&mut key);
+                check_strict(&fragments, guarded)?;
                 write_atomic(&p, &buf)?;
                 Ok(())
             })?;
@@ -243,10 +259,14 @@ fn proc<'py>(
             // pointer would break Send (disjoint capture hoists it out)
             let base: usize = bytes.as_bytes().as_ptr() as usize;
             let fragments: Vec<process::FragmentStat> = py.detach(move || -> PyResult<Vec<process::FragmentStat>> {
+                let mut key: Option<[u8; 16]> = key;
                 let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, len) };
-                Ok(process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), buf)?)
+                let fragments: Vec<process::FragmentStat> =
+                    process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), buf)?;
+                wipe_key(&mut key);
+                Ok(fragments)
             })?;
-            check_strict(&fragments, key, strict)?;
+            check_strict(&fragments, guarded)?;
             Ok(Some(bytes.into_any()))
         }
     }
@@ -274,20 +294,23 @@ fn aproc<'py>(
     strict : bool
 ) -> PyResult<Bound<'py, PyAny>> {
     let Args { input, output, key, kid, core_meta }: Args = parse_args(py, input, out, key, kid, meta)?;
+    let guarded: bool = strict && key.is_some();
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) = tokio::task::spawn_blocking(
-            move || load_and_measure(input, key, kid, core_meta),
+            move || load_and_measure(input, key.is_some(), kid, core_meta),
         ).await.map_err(join_err)??;
         match output {
             Output::Path(p) => {
                 // write+rename run inside ONE blocking task with the build — a
                 // cancelled future cannot split the pair and leave a tmp behind
                 tokio::task::spawn_blocking(move || -> PyResult<()> {
+                    let mut key: Option<[u8; 16]> = key;
                     let mut buf: Vec<u8> = vec![0u8; len];
                     let fragments: Vec<process::FragmentStat> =
                         process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
-                    check_strict(&fragments, key, strict)?;
+                    wipe_key(&mut key);
+                    check_strict(&fragments, guarded)?;
                     write_atomic(&p, &buf)?;
                     Ok(())
                 }).await.map_err(join_err)??;
@@ -295,16 +318,24 @@ fn aproc<'py>(
             }
             Output::Return => {
                 // allocate the result under a brief GIL attach, then build off-GIL
-                // straight into its buffer — no intermediate copy
+                // straight into its buffer — no intermediate copy. The PyBytes
+                // owner moves INTO the build task: a cancelled future drops its
+                // own references but the buffer stays referenced for the whole
+                // write (dropping it early would free the object under the writer)
                 let (base, result): (usize, Py<PyBytes>) = Python::attach(|py| -> PyResult<(usize, Py<PyBytes>)> {
                     let b: Bound<'_, PyBytes> = PyBytes::new_with(py, len, |_buf: &mut [u8]| Ok(()))?;
                     Ok((b.as_bytes().as_ptr() as usize, b.unbind()))
                 })?;
-                let fragments: Vec<process::FragmentStat> = tokio::task::spawn_blocking(move || -> PyResult<Vec<process::FragmentStat>> {
-                    let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, len) };
-                    Ok(process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), buf)?)
-                }).await.map_err(join_err)??;
-                check_strict(&fragments, key, strict)?;
+                let (fragments, result): (Vec<process::FragmentStat>, Py<PyBytes>) =
+                    tokio::task::spawn_blocking(move || -> PyResult<(Vec<process::FragmentStat>, Py<PyBytes>)> {
+                        let mut key: Option<[u8; 16]> = key;
+                        let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, len) };
+                        let fragments: Vec<process::FragmentStat> =
+                            process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), buf)?;
+                        wipe_key(&mut key);
+                        Ok((fragments, result))
+                    }).await.map_err(join_err)??;
+                check_strict(&fragments, guarded)?;
                 Ok(Some(result))
             }
         }

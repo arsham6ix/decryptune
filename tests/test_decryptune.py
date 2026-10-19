@@ -596,6 +596,23 @@ def test_aproc_cancel_no_tmp_litter(sp, src_file, tmp_path):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_aproc_cancel_return(sp, sample):
+    # cancelling bytes-return aprocs mid-flight must be memory-safe — the
+    # result owner moves into the build task, so a dropped future can never
+    # free the output buffer under the writer's feet (use-after-free regression)
+    data, _ = sample
+
+    async def main():
+        for _ in range(8):
+            tasks = [asyncio.create_task(sp.aproc(input=data, key=KEY_HEX)) for _ in range(16)]
+            await asyncio.sleep(0.001)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(main())
+
+
 # ---- metadata ---------------------------------------------------------------
 
 def test_udta_first(sp, tagged):
