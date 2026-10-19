@@ -182,11 +182,6 @@ def build_sample_file():
     moof3 = make_moof(3, [make_tfhd(sizes[0]), make_trun(sizes, 0, with_sizes=False),
                           make_senc(ivs)])
 
-    # trun data_offset: first byte of sample data relative to moof start
-    def set_offset(moof, off):
-        i = moof.find(b"trun")           # position of the type string
-        return moof[:i + 12] + i32(off) + moof[i + 16:]
-
     moof1 = set_offset(moof1, len(moof1) + 8)
     moof2 = set_offset(moof2, len(moof2) + 8)
     moof3 = set_offset(moof3, len(moof3) + 8)
