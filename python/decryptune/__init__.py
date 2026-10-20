@@ -29,7 +29,7 @@ except ImportError:
     _native = importlib.util.module_from_spec(importlib.util.spec_from_loader("decryptune", _loader))
     _loader.exec_module(_native)
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
 
 
