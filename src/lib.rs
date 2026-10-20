@@ -16,12 +16,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use error::Err;
 use input::{parse_input, parse_output, InputData, Output};
 
+// strict [0-9a-fA-F] nibbles, decoded byte-wise: a multi-byte UTF-8 char can
+// neither panic a char-boundary slice nor slip through from_str_radix, which
+// would happily accept a sign-prefixed pair like "+f" as 0x0f
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None
+    }
+}
+
 fn parse_hex16(hex: &str) -> Result<[u8; 16], Err> {
-    let hex: &str = hex.trim();
+    let hex: &[u8] = hex.trim().as_bytes();
     if hex.len() != 32 { return Err(Err::InvalidKey); }
     let mut key: [u8; 16] = [0u8; 16];
     for (i, b) in key.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| Err::InvalidKey)?;
+        let hi: u8 = hex_nibble(hex[i * 2]).ok_or(Err::InvalidKey)?;
+        let lo: u8 = hex_nibble(hex[i * 2 + 1]).ok_or(Err::InvalidKey)?;
+        *b = (hi << 4) | lo;
     }
     Ok(key)
 }
@@ -155,16 +169,6 @@ impl TuneMeta {
     }
 }
 
-// parsed proc/aproc arguments — every Send piece is resolved under the GIL
-// once, then moved wholesale into the worker
-struct Args {
-    input    : input::Input,
-    output   : Output,
-    key      : Option<[u8; 16]>,
-    kid      : Option<String>,
-    core_meta: Option<meta::CoreMeta>
-}
-
 fn parse_args(
     py   : Python<'_>,
     input: &Bound<'_, PyAny>,
@@ -180,6 +184,25 @@ fn parse_args(
         kid      : kid.map(|s| s.to_string()),
         core_meta: resolve_meta(py, meta)?
     })
+}
+
+// parse_args product with the has_key flag precomputed — measure/load never
+// needs the key itself, only whether one was supplied (for the KID guard)
+struct Args {
+    input    : input::Input,
+    output   : Output,
+    key      : Option<[u8; 16]>,
+    kid      : Option<String>,
+    core_meta: Option<meta::CoreMeta>
+}
+
+type ParsedArgs = (input::Input, Output, Option<[u8; 16]>, Option<String>, Option<meta::CoreMeta>, bool);
+
+impl Args {
+    fn into_parts(self) -> ParsedArgs {
+        let has_key: bool = self.key.is_some();
+        (self.input, self.output, self.key, self.kid, self.core_meta, has_key)
+    }
 }
 
 // Python TuneMeta → Send CoreMeta: only raw byte copies and path strings happen under
@@ -231,9 +254,9 @@ fn proc<'py>(
     meta   : Option<&TuneMeta>,
     strict : bool
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let Args { input, output, key, kid, core_meta }: Args = parse_args(py, input, out, key, kid, meta)?;
+    let (input, output, key, kid, core_meta, has_key): ParsedArgs = parse_args(py, input, out, key, kid, meta)?.into_parts();
     let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) =
-        py.detach(move || load_and_measure(input, key.is_some(), kid, core_meta)).map_err(PyErr::from)?;
+        py.detach(move || load_and_measure(input, has_key, kid, core_meta)).map_err(PyErr::from)?;
     let guarded: bool = strict && key.is_some();
 
     match output {
@@ -293,12 +316,12 @@ fn aproc<'py>(
     meta   : Option<&TuneMeta>,
     strict : bool
 ) -> PyResult<Bound<'py, PyAny>> {
-    let Args { input, output, key, kid, core_meta }: Args = parse_args(py, input, out, key, kid, meta)?;
+    let (input, output, key, kid, core_meta, has_key): ParsedArgs = parse_args(py, input, out, key, kid, meta)?.into_parts();
     let guarded: bool = strict && key.is_some();
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) = tokio::task::spawn_blocking(
-            move || load_and_measure(input, key.is_some(), kid, core_meta),
+            move || load_and_measure(input, has_key, kid, core_meta),
         ).await.map_err(join_err)??;
         match output {
             Output::Path(p) => {

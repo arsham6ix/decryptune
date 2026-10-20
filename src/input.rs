@@ -60,11 +60,13 @@ pub(crate) fn extract_bytes_or_path(value: &Bound<'_, PyAny>, bad: Err) -> PyRes
     } else if let Ok(b) = value.cast::<PyByteArray>() {
         Extracted::Bytes(b.to_vec()) // mutable — a copy is mandatory
     } else if let Ok(s) = value.cast::<PyString>() {
-        Extracted::Path(s.to_str()?.to_string())
+        // to_str fails only on lone surrogates (real on Windows via os.fsdecode) —
+        // the Rust core takes String paths only, so that input has no valid encoding
+        Extracted::Path(s.to_str().map_err(|_| bad)?.to_string())
     } else if let Ok(p) = value.call_method0("__fspath__") { // os.PathLike
         // fspath may legally return bytes — map that here, never a raw downcast error
         Extracted::Path(if let Ok(s) = p.cast::<PyString>() {
-            s.to_str()?.to_string()
+            s.to_str().map_err(|_| bad)?.to_string()
         } else if let Ok(b) = p.cast::<PyBytes>() {
             String::from_utf8_lossy(b.as_bytes()).into_owned()
         } else {
@@ -96,11 +98,12 @@ pub(crate) fn parse_output(out: Option<&Bound<'_, PyAny>>) -> PyResult<Output> {
         None => Ok(Output::Return),
         Some(v) => {
             let path: String = if let Ok(s) = v.cast::<PyString>() {
-                s.to_str()?.to_string()
+                // lone surrogates have no Rust-side String encoding — coded error, not a leak
+                s.to_str().map_err(|_| Err::BadOutput)?.to_string()
             } else if let Ok(p) = v.call_method0("__fspath__") { // os.PathLike
                 // same fspath-bytes rule as input — a coded error, not a raw downcast
                 if let Ok(s) = p.cast::<PyString>() {
-                    s.to_str()?.to_string()
+                    s.to_str().map_err(|_| Err::BadOutput)?.to_string()
                 } else if let Ok(b) = p.cast::<PyBytes>() {
                     String::from_utf8_lossy(b.as_bytes()).into_owned()
                 } else {

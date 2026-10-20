@@ -358,6 +358,36 @@ def test_error_invalid_kid(sp, src_file):
     assert e.value.code == 2
 
 
+def test_error_key_multibyte_utf8(sp, src_file):
+    # exactly 32 BYTES with a 2-byte char at an odd offset — the hex decoder
+    # must reject it with code 1, not panic on a char-boundary slice
+    for bad in ("a" * 29 + "Ω" + "b", "a" * 27 + "Ω" + "bbb"):
+        with pytest.raises(DecrypTuneError) as e:
+            sp.proc(input=src_file, key=bad)
+        assert e.value.code == 1
+        with pytest.raises(DecrypTuneError) as e:
+            sp.proc(input=src_file, key=KEY_HEX, kid=bad)
+        assert e.value.code == 2
+
+
+def test_error_key_sign_prefixed(sp, src_file):
+    # from_str_radix accepts "+f" as 0x0f — the nibble decoder must not
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=src_file, key="+f" * 16)
+    assert e.value.code == 1
+
+
+def test_error_surrogate_path(sp, src_file):
+    # os.fsdecode on Windows can produce lone surrogates — a coded input error,
+    # never a raw UnicodeEncodeError
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input="D:\\bad\udce9path.mp4")
+    assert e.value.code == 9
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=src_file, out="D:\\bad\udce9out.m4a")
+    assert e.value.code == 10
+
+
 def test_error_missing_input(sp, tmp_path):
     with pytest.raises(DecrypTuneError) as e:
         sp.proc(input=str(tmp_path / "missing.m4a"), key=KEY_HEX)
