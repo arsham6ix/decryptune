@@ -9,12 +9,18 @@ use crate::meta::Cover;
 use crate::Err;
 
 const MAX_EDGE: u32 = 1000;
+// a cover lands inside the ilst whole — 32MB is far above any real art and
+// keeps a hostile "cover" from bloating the output file without bound
+const MAX_COVER_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn is_jpeg(b: &[u8]) -> bool { b.len() >= 2 && b[0] == 0xFF && b[1] == 0xD8 }
 pub(crate) fn is_png(b: &[u8]) -> bool { b.len() >= 8 && b[0..4] == [0x89, 0x50, 0x4E, 0x47] }
 
 /// Validate and (when needed) downscale a cover image to fit MAX_EDGE.
 pub(crate) fn prepare(raw: &[u8]) -> Result<Cover<'_>, Err> {
+    if raw.len() > MAX_COVER_BYTES {
+        return Err(Err::CoverTooLarge);
+    }
     if is_png(raw) {
         return Ok(Cover { data: Cow::Borrowed(raw), kind: 14 });
     }

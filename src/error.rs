@@ -19,7 +19,8 @@ pub(crate) enum Err {
     BadOutput           = 10,
     MetaNeedsFragmented = 11,
     BadCover            = 12,
-    CoverNotFound       = 13 // additive: a missing cover path must not read as a missing input
+    CoverNotFound       = 13, // additive: a missing cover path must not read as a missing input
+    CoverTooLarge       = 14  // additive: an absurd cover must not flow into the ilst whole
 }
 
 impl Err {
@@ -37,7 +38,8 @@ impl Err {
             Err::BadInput            => "invalid input: expected bytes, bytearray, memoryview, or a path",
             Err::BadOutput           => "invalid out: expected a path or None",
             Err::MetaNeedsFragmented => "metadata write requires a fragmented file (non-empty chunk offsets)",
-            Err::BadCover            => "unsupported cover format: expected JPEG or PNG"
+            Err::BadCover            => "unsupported cover format: expected JPEG or PNG",
+            Err::CoverTooLarge       => "cover too large (max 32 MB)"
         }
     }
 }

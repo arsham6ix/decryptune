@@ -118,11 +118,38 @@ fn encode_edge_blocks() {
 
 #[test]
 fn hostile_huge_sof_rejected() {
-    // a 65535x65535 SOF claim must fail validation before any buffer is
-    // allocated — without the pixel cap this tries to reserve ~8GB
-    let sof: [u8; 11] = [0, 11, 8, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0x11, 0];
-    let jpg: Vec<u8> = [&[0xFF, 0xD8, 0xFF, 0xC0][..], &sof, &[0xFF, 0xD9][..]].concat();
-    assert!(decode(&jpg).is_err());
+    // SOF claims must fail validation before any buffer is allocated — a
+    // 65535x65535 claim wants ~8GB of coefficient buffers, and 16384x16384
+    // (the old 256MP cap's boundary) still wants ~1GB
+    for (w, h) in [(0xFFFFu16, 0xFFFFu16), (16384u16, 16384u16)] {
+        let sof: [u8; 11] = [0, 11, 8, (h >> 8) as u8, h as u8, (w >> 8) as u8, w as u8, 1, 1, 0x11, 0];
+        let jpg: Vec<u8> = [&[0xFF, 0xD8, 0xFF, 0xC0][..], &sof, &[0xFF, 0xD9][..]].concat();
+        assert!(decode(&jpg).is_err(), "{w}x{h} not rejected");
+    }
+}
+
+#[test]
+fn hostile_dht_rejected() {
+    // DC magnitude symbols above 15 would underflow the bit reader's count and
+    // overfull canonical tables would overflow the code book — both rejected
+    // at DHT parse time (a debug build once panicked on the first)
+    let dqt: Vec<u8> = [[0xFFu8, 0xDB].as_slice(), &67u16.to_be_bytes(), &[0x00], &[1u8; 64]].concat();
+    let sof: Vec<u8> = [[0xFFu8, 0xC0].as_slice(), &11u16.to_be_bytes(), &[8u8, 0, 16, 0, 16, 1, 1, 0x11, 0]].concat();
+    let ac: Vec<u8> = [[0xFFu8, 0xC4].as_slice(), &20u16.to_be_bytes(), &[0x10], &[1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[0]].concat();
+    let sos: Vec<u8> = [[0xFFu8, 0xDA].as_slice(), &8u16.to_be_bytes(), &[1u8, 1, 0, 0, 63, 0]].concat();
+    let dht = |class: u8, counts: &[u8], symbols: &[u8]| -> Vec<u8> {
+        [[0xFFu8, 0xC4].as_slice(), &((2 + 1 + 16 + symbols.len()) as u16).to_be_bytes(), &[class], counts, symbols].concat()
+    };
+    let counts_len1: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let counts_overfull: [u8; 16] = [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let entropy_and_eoi = &[0x00u8, 0x00, 0xFF, 0xD9][..];
+    for bad_dht in [
+        dht(0x00, &counts_len1, &[200]),                     // DC symbol 200
+        dht(0x00, &counts_overfull, &[0, 1, 2, 3]),          // 3 one-bit codes
+    ] {
+        let jpg: Vec<u8> = [&[0xFF, 0xD8][..], &dqt, &sof, &bad_dht, &ac, &sos, entropy_and_eoi].concat();
+        assert!(decode(&jpg).is_err());
+    }
 }
 
 // DUMP_ENC=1 + JPEG_FIXTURES: write our encode of the p444 reference so the

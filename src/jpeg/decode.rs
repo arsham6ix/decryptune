@@ -6,9 +6,10 @@ use super::ZIGZAG;
 use crate::Err;
 
 // hostile SOF dimensions can demand multi-GB coefficient buffers before any
-// entropy byte is read — no real cover comes close (a 150MP medium-format
-// shot sits 2x under this); anything above is a decompression bomb
-const MAX_PIXELS: usize = 268_435_456; // 256 megapixels
+// entropy byte is read — covers are downscaled to 1000px anyway, so 64MP
+// (8192²) is far beyond anything legitimate; at the old 256MP cap a ~1MB
+// hostile JPEG forced ~1GB of buffers and seconds of IDCT
+const MAX_PIXELS: usize = 67_108_864; // 64 megapixels
 
 struct HuffTable {
     counts    : [u8; 17],   // symbols per code length 1..=16
@@ -18,15 +19,20 @@ struct HuffTable {
 }
 
 impl HuffTable {
-    fn build(counts: &[u8; 17], symbols: Vec<u8>) -> HuffTable {
-        let (mut first_code, mut val_off, mut code, mut k): ([u16; 17], [usize; 17], u16, usize) = ([0; 17], [0; 17], 0, 0);
+    // canonical code assignment with an overfull check: a table claiming more
+    // codes than a length's code space holds would overflow the u16 code and
+    // decode garbage downstream
+    fn build(counts: &[u8; 17], symbols: Vec<u8>) -> Result<HuffTable, Err> {
+        let (mut first_code, mut val_off, mut code, mut k): ([u16; 17], [usize; 17], u32, usize) = ([0; 17], [0; 17], 0, 0);
         for len in 1..=16 {
-            first_code[len] = code;
+            first_code[len] = code as u16;
             val_off[len] = k;
             k += counts[len] as usize;
-            code = (code + counts[len] as u16) << 1;
+            code += counts[len] as u32;
+            if code > (1u32 << len) { return Err(Err::BadCover); }
+            code <<= 1;
         }
-        HuffTable { counts: *counts, first_code, val_off, symbols }
+        Ok(HuffTable { counts: *counts, first_code, val_off, symbols })
     }
 
     fn decode(&self, br: &mut BitReader<'_>) -> Result<u8, Err> {
@@ -34,7 +40,9 @@ impl HuffTable {
         for len in 1..=16 {
             code = (code << 1) | br.bit()? as i32;
             let (fc, cnt): (i32, i32) = (self.first_code[len] as i32, self.counts[len] as i32);
-            if code - fc < cnt {
+            // cnt > 0 keeps an empty length from matching via a negative diff
+            // (code below the canonical first code of a longer prefix)
+            if cnt > 0 && code >= fc && code - fc < cnt {
                 return Ok(self.symbols[self.val_off[len] + (code - fc) as usize]);
             }
         }
@@ -365,7 +373,12 @@ pub(crate) fn decode(raw: &[u8]) -> Result<(usize, usize, usize, Vec<u8>), Err> 
                         counts[1..].copy_from_slice(&raw[p + 1..p + 17]);
                         let total: usize = counts[1..].iter().map(|&c| c as usize).sum();
                         if p + 17 + total > pos + seg { return Err(Err::BadCover); }
-                        let table: HuffTable = HuffTable::build(&counts, raw[p + 17..p + 17 + total].to_vec());
+                        // a DC symbol is a magnitude category (0..=15): anything
+                        // larger would underflow the bit reader's bit count
+                        if tc == 0 && raw[p + 17..p + 17 + total].iter().any(|&s| s > 15) {
+                            return Err(Err::BadCover);
+                        }
+                        let table: HuffTable = HuffTable::build(&counts, raw[p + 17..p + 17 + total].to_vec())?;
                         if tc == 0 { dcs[th] = Some(table); } else { acs[th] = Some(table); }
                         p += 17 + total;
                     }
@@ -592,9 +605,13 @@ fn upsample_h2v2(plane: &[u8], pw: usize, ph: usize, w: usize, oh: usize) -> Vec
     for j in 0..oh.div_ceil(2) {
         let cur = &plane[j.min(ph - 1) * pw..];
         for dy in 0..2 {
+            // an odd output height ends on a dy=0 row; the below-blend pass
+            // would write row `oh` past the buffer, so it lands on `oh - 1`
+            // (libjpeg's bottom-edge replication)
+            let dst: usize = (2 * j + dy).min(oh - 1);
             let orow: usize = if dy == 0 { j.saturating_sub(1).min(ph - 1) } else { (j + 1).min(ph - 1) };
             let oth = &plane[orow * pw..];
-            let orow_out = &mut out[(2 * j + dy) * w..(2 * j + dy) * w + w];
+            let orow_out = &mut out[dst * w..dst * w + w];
             let colsum = |i: usize| -> u32 { (cur[i.min(pw - 1)] as u32) * 3 + (oth[i.min(pw - 1)] as u32) };
             let (c0, c1): (u32, u32) = (colsum(0), colsum(1));
             orow_out[0] = ((c0 * 4 + 8) >> 4) as u8;

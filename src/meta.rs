@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use crate::boxes::{parse, write_header, Writer};
+use crate::boxes::{parse, write_header, Box, Writer};
 use crate::Err;
 
 pub(crate) struct Cover<'a> {
@@ -145,8 +145,12 @@ fn hdlr_box() -> Vec<u8> {
 pub(crate) fn append_moov_with_meta(out: &mut Writer<'_>, children: &[u8], meta: &CoreMeta) -> Result<(), Err> {
     // every old udta goes — keeping any would both leak stale tags and shadow the
     // fresh subtree for the Windows handler (it reads only the first udta/meta)
-    let udta: Vec<(usize, usize)> = parse(children, 0, children.len())
-        .iter().filter(|c| c.is(b"udta")).map(|c| (c.start, c.end)).collect();
+    let top: Vec<Box> = parse(children, 0, children.len());
+    if top.len() >= crate::boxes::MAX_BOXES {
+        return Err(Err::InvalidMp4); // saturated parse: the udta map would be wrong
+    }
+    let udta: Vec<(usize, usize)> = top.iter().filter(|c| c.is(b"udta"))
+        .map(|c| (c.start, c.end)).collect();
 
     let mut ilst: Vec<u8> = Vec::new();
     build_items(&mut ilst, meta)?;

@@ -58,14 +58,17 @@ fn tmp_path(out_path: &str) -> String {
     format!("{}.{}.{}.tmp", out_path, std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
-// write to <out>.<n>.tmp then rename — no partial outputs on crash.
+// write to <out>.<n>.tmp, flush it to disk, then rename — no partial outputs
+// on crash, and the rename cannot expose unflushed data after a power loss.
 // create_new (O_CREAT|O_EXCL) refuses a symlink pre-placed at the predictable
 // tmp name and fails on collision instead of clobbering an existing file
 fn write_atomic(out_path: &str, data: &[u8]) -> Result<(), Err> {
     let tmp: String = tmp_path(out_path);
     let mut file: std::fs::File = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
         .map_err(|_| Err::WriteFailed)?;
-    if file.write_all(data).is_err() || std::fs::rename(&tmp, out_path).is_err() {
+    if file.write_all(data).is_err()
+        || file.sync_data().is_err()
+        || std::fs::rename(&tmp, out_path).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return Err(Err::WriteFailed);
     }

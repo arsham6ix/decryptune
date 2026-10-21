@@ -418,6 +418,32 @@ def test_error_invalid_out_type(sp, src_file):
     assert e.value.code == 10
 
 
+def test_trun_sample_cap_bomb(sp):
+    # 200 default-fill truns each claiming 2^32-1 samples: the sizes vec once
+    # scaled with the FILE size per trun (~6.4GB from this 32MB file, an
+    # allocation abort). The per-fragment sample cap marks the fragment
+    # oversized → plain passthrough, identical to the no-key pass.
+    ftyp = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom")
+    traf = box(b"tfhd", u32(0x10) + u32(1) + u32(64))
+    traf += (box(b"trun", u32(0) + u32(0xFFFFFFFF)) * 200)
+    moof = box(b"moof", box(b"mfhd", u32(0) + u32(1)) + box(b"traf", traf))
+    data = ftyp + moof + box(b"mdat", b"\x00" * 65536)
+    data += box(b"free", b"\x00" * (32 * 1024 * 1024 - len(data)))
+    data += make_moov()
+    out = sp.proc(input=data, key=KEY_HEX, strict=True)
+    assert out == sp.proc(input=data)
+
+
+def test_box_spam_rejected(sp):
+    # 3M top-level boxes: parse vec saturation now fails the file outright
+    # (coded 4) instead of materializing ~96MB of box structures
+    data = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") + \
+        (u32(8) + b"free") * 3_000_000
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=data)
+    assert e.value.code == 4
+
+
 def test_error_bad_cover(sp, src_file):
     with pytest.raises(DecrypTuneError) as e:
         sp.proc(input=src_file, key=KEY_HEX, meta=TuneMeta(cover=b"notanimage"))
@@ -430,6 +456,15 @@ def test_error_cover_missing(sp, src_file):
         sp.proc(input=src_file, key=KEY_HEX, meta=TuneMeta(cover="no_such_cover.jpg"))
     assert e.value.code == 13
     assert "cover file not found" in e.value.message
+
+
+def test_error_cover_too_large(sp, src_file):
+    # additive code 14 — covers land inside the ilst whole, so an absurd one
+    # must be refused instead of bloating the output without bound
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=src_file, key=KEY_HEX, meta=TuneMeta(cover=b"\x89PNG\r\n\x1a\n" + bytes(33 * 1024 * 1024)))
+    assert e.value.code == 14
+    assert "cover too large" in e.value.message
 
 
 def test_path_out_pathlib(sp, src_file, tmp_path):
@@ -544,6 +579,80 @@ def test_strict(sp, sample):
         sp.proc(input=data, key=FAKE_KEY_HEX, strict=True)
     assert e.value.code == 8
     assert "fragments:" in str(e.value) and "chi2=" in str(e.value)
+
+
+def test_strict_judges_4kb_fragments(sp):
+    # the judge floor used to sit at 16KB, so a fake-key file of 4KB fragments
+    # slipped through strict with every fragment unjudged; 4KB is now judged
+    # (noise stays df-bound at ~255, structured 4KB fragments score ~950+)
+    parts, sizes = [], []
+    for f in range(100):
+        iv = struct.pack(">H", f) + bytes([1, 2, 3, 4, 5, 6])
+        enc = ctr_crypt(KEY, iv, bytes([0x11]) * 4096)
+        moof = make_moof(f + 1, [make_tfhd(), make_trun([4096], 0), make_senc([iv])])
+        i = moof.find(b"trun")
+        moof = moof[:i + 12] + i32(len(moof) + 8) + moof[i + 16:]
+        parts.append(mof := moof + box(b"mdat", enc))
+        sizes.append(len(mof))
+    data = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") + make_sidx(sizes) + b"".join(parts) + make_moov()
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=data, key=FAKE_KEY_HEX, strict=True)
+    assert e.value.code == 8
+    out = sp.proc(input=data, key=KEY_HEX, strict=True)  # the real key still passes
+    assert sp.proc(input=out) == out
+
+
+def test_single_huge_fragment_strict(sp):
+    # one 9MB fragment crosses the parallel gate with a single job — the
+    # sample-aligned chunk splitter must produce byte-identical output and the
+    # same strict verdict as the serial path
+    iv = bytes([9, 8, 7, 6, 5, 4, 3, 2])
+    payload = bytes([0x5A * (9 * 1024 * 1024 // 1024) & 0xFF]) * (9 * 1024 * 1024)
+    enc = ctr_crypt(KEY, iv, payload)
+    moof = make_moof(1, [make_tfhd(), make_trun([len(payload)], 0), make_senc([iv])])
+    i = moof.find(b"trun")
+    moof = moof[:i + 12] + i32(len(moof) + 8) + moof[i + 16:]
+    data = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") + \
+        moof + box(b"mdat", enc) + make_moov()
+    out = sp.proc(input=data, key=KEY_HEX, strict=True)
+    assert out == sp.proc(input=data, key=KEY_HEX)
+    assert sp.proc(input=out) == out
+    with pytest.raises(DecrypTuneError) as e:
+        sp.proc(input=data, key=FAKE_KEY_HEX, strict=True)
+    assert e.value.code == 8
+
+
+def test_shared_mdat_not_decrypted(sp):
+    # moof,moof,mdat: the payload is not adjacent to the first fragment, so no
+    # plan can be trusted on it — both fragments pass through undecrypted
+    # instead of the second fragment's plan mis-decrypting the shared mdat
+    def frag(seq, iv):
+        moof = make_moof(seq, [make_tfhd(), make_trun([64], 0), make_senc([iv])])
+        i = moof.find(b"trun")
+        return moof[:i + 12] + i32(len(moof) + 8) + moof[i + 16:]
+    data = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") + \
+        frag(1, bytes([1, 2, 3, 4, 5, 6, 7, 8])) + \
+        frag(2, bytes([9, 8, 7, 6, 5, 4, 3, 2])) + \
+        box(b"mdat", ctr_crypt(KEY, bytes([9, 8, 7, 6, 5, 4, 3, 2]), bytes([0x22]) * 64)) + \
+        make_moov()
+    assert sp.proc(input=data, key=KEY_HEX, strict=True) == sp.proc(input=data)
+
+
+def test_subsample_encrypted_passthrough(sp):
+    # real subsample entries (flags 0x2, non-empty tables) mean partially clear
+    # samples — full-sample decryption would corrupt the clear bytes, so the
+    # fragment passes through instead of decrypting wrongly
+    iv = bytes([5, 5, 5, 5, 5, 5, 5, 5])
+    senc = box(b"senc", u32(0x00000002) + u32(1) + iv +
+               u16(1) + u16(2) + u32(6))  # one entry: 2 clear + 6 protected
+    moof = make_moof(1, [make_tfhd(), make_trun([64], 0)])
+    i = moof.find(b"trun")
+    moof = moof[:i + 12] + i32(len(moof) + 8) + moof[i + 16:]
+    traf_pos = moof.find(make_senc([iv]))
+    moof = moof[:traf_pos] + senc + moof[traf_pos + len(make_senc([iv])):]
+    data = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") + \
+        moof + box(b"mdat", ctr_crypt(KEY, iv, bytes([0x33]) * 64)) + make_moov()
+    assert sp.proc(input=data, key=KEY_HEX, strict=True) == sp.proc(input=data)
 
 
 def test_fuzz_no_native_panics(sp, sample):
@@ -713,6 +822,18 @@ def test_cover_passthrough(sp, sample):
     tagged = sp.proc(input=data, key=KEY_HEX, meta=TuneMeta(cover=os.path.join(FIXTURES, "tiny.jpg")))
     cov = ilst_items(tagged)[b"covr"][0]
     assert cov[16:struct.unpack_from(">I", cov, 0)[0]] == tiny
+
+
+def test_cover_odd_height_420(sp, sample):
+    # 1100x1099 4:2:0 — the fancy h2v2 upsampler once wrote one row past the
+    # output buffer for odd heights (the most common JPEG layout) and panicked
+    data, _ = sample
+    tagged = sp.proc(input=data, key=KEY_HEX, meta=TuneMeta(cover=os.path.join(FIXTURES, "odd420.jpg")))
+    cov = ilst_items(tagged)[b"covr"][0]
+    csize = struct.unpack_from(">I", cov, 0)[0]
+    assert struct.unpack_from(">I", cov, 8)[0] == 13
+    w, h = jpeg_dims(cov[16:csize])
+    assert max(w, h) <= 1000 and min(w, h) == 999
 
 
 def test_cover_bytearray(sp, sample):
