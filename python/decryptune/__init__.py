@@ -39,7 +39,7 @@ except ImportError as _imp_err:
         raise ImportError(f"staged extension {_lib} failed to load: {_load_err}") from _load_err
     sys.modules[f"{__name__}.decryptune"] = _native  # register like a real submodule import
 
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
 
 
