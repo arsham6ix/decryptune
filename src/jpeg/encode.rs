@@ -106,6 +106,9 @@ impl EncTable {
     }
 
     fn put(&self, bw: &mut BitWriter, sym: usize) {
+        // a symbol absent from the table has len 0 — put() would silently
+        // emit NOTHING and the stream would corrupt without an error
+        debug_assert!(self.lens[sym] != 0, "Huffman symbol {sym} missing from its table");
         bw.put(self.codes[sym] as u32, self.lens[sym] as u32);
     }
 }
@@ -248,7 +251,10 @@ fn push_dht(out: &mut Vec<u8>, class_id: u8, bits: &[u8; 16], vals: &[u8]) {
 
 /// Encode gray (ch=1) or RGB (ch=3) pixels into baseline JPEG bytes.
 pub(crate) fn encode(pix: &[u8], w: usize, h: usize, ch: usize) -> Result<Vec<u8>, Err> {
-    if w == 0 || h == 0 || (ch != 1 && ch != 3) || pix.len() < w * h * ch { return Err(Err::BadCover); }
+    // dims must fit the u16 SOF0 fields and the shared 64MP cap — range-checked
+    // BEFORE any size math so the width×height products can never overflow
+    // (callers pre-cap at 1000px; this is the encoder's own defense)
+    if w == 0 || h == 0 || w > 0xFFFF || h > 0xFFFF || w * h > super::decode::MAX_PIXELS || (ch != 1 && ch != 3) || pix.len() < w * h * ch { return Err(Err::BadCover); }
     let (y, cb, cr): (Vec<u8>, Vec<u8>, Vec<u8>) = if ch == 1 {
         (pix.to_vec(), Vec::new(), Vec::new())
     } else {

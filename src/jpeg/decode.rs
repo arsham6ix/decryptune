@@ -9,7 +9,7 @@ use crate::Err;
 // entropy byte is read — covers are downscaled to 1000px anyway, so 64MP
 // (8192²) is far beyond anything legitimate; at the old 256MP cap a ~1MB
 // hostile JPEG forced ~1GB of buffers and seconds of IDCT
-const MAX_PIXELS: usize = 67_108_864; // 64 megapixels
+pub(super) const MAX_PIXELS: usize = 67_108_864; // 64 megapixels
 
 struct HuffTable {
     counts    : [u8; 17],   // symbols per code length 1..=16

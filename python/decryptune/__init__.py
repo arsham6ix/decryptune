@@ -11,11 +11,13 @@ from pathlib import Path
 
 try:
     from . import decryptune as _native
-except ImportError:
+except ImportError as _imp_err:
     # source checkout: load the staged extension from the repo root (or beside
     # the package); the loader requires PyInit_decryptune, so the module keeps
     # that name. The candidate order is platform-aware — the repo may stage
-    # builds for several platforms side by side.
+    # builds for several platforms side by side. A broken extension load
+    # (missing runtime DLL, arch mismatch) raises the SAME ImportError as a
+    # missing module, so the staged candidates are scanned before giving up.
     import sys
 
     _names: tuple[str, ...] = ("decryptune.pyd",) if sys.platform == "win32" else \
@@ -24,10 +26,18 @@ except ImportError:
     _candidates = [base / n for base in (_pkg.parent.parent, _pkg.parent, _pkg) for n in _names]
     _lib = next((p for p in _candidates if p.exists()), None)
     if _lib is None:
-        raise
+        raise ImportError(
+            f"no staged native extension found (tried: {', '.join(map(str, _candidates))}); "
+            f"if the package is installed as a wheel, its bundled extension may have failed "
+            f"to load (missing runtime DLL, wrong arch): {_imp_err}"
+        ) from _imp_err
     _loader = importlib.machinery.ExtensionFileLoader("decryptune", str(_lib))
     _native = importlib.util.module_from_spec(importlib.util.spec_from_loader("decryptune", _loader))
-    _loader.exec_module(_native)
+    try:
+        _loader.exec_module(_native)
+    except ImportError as _load_err:
+        raise ImportError(f"staged extension {_lib} failed to load: {_load_err}") from _load_err
+    sys.modules[f"{__name__}.decryptune"] = _native  # register like a real submodule import
 
 __version__ = "1.1.5"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
@@ -50,16 +60,22 @@ class DecrypTuneError(Exception):
         return f"DecrypTuneError(code={self.code}, message={self.message!r})"
 
 
-# all error messages are authored by the native core — this wrapper relays [code] + message;
-# anything without a [N] prefix is not a native error and propagates unchanged
+# all error messages are authored by the native core (error.rs) — this wrapper
+# relays [code] + message; anything outside the known code range (or without a
+# [N] prefix) is not a native error and propagates unchanged
+_NATIVE_CODES: frozenset[int] = frozenset(range(1, 15))  # 14 = CoverTooLarge is the last
+
+
 def _to_err(exc: Exception) -> DecrypTuneError | None:
     msg: str = str(exc)
     end: int = msg.find("]")
     if msg.startswith("[") and end != -1:
         try:
-            return DecrypTuneError(int(msg[1:end]), msg[end + 1:].strip())
+            code: int = int(msg[1:end])
         except ValueError:
-            pass
+            return None
+        if code in _NATIVE_CODES:
+            return DecrypTuneError(code, msg[end + 1:].strip())
     return None
 
 

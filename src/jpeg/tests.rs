@@ -152,6 +152,17 @@ fn hostile_dht_rejected() {
     }
 }
 
+#[test]
+fn hostile_encode_dims_rejected() {
+    // SOF0 stores dimensions in u16 fields — a wider dim used to truncate
+    // silently and produce a corrupt file; the pixel cap is shared with the
+    // decoder. All rejected BEFORE any allocation
+    assert!(encode(&[0u8; 4], 70_000, 1, 1).is_err());  // over the u16 field
+    assert!(encode(&[0u8; 4], 1, 70_000, 3).is_err());  // over the u16 field
+    assert!(encode(&[0u8; 4], 10_000, 10_000, 1).is_err()); // over the 64MP cap
+    assert!(encode(&[0u8; 1], 0, 0, 1).is_err());
+}
+
 // DUMP_ENC=1 + JPEG_FIXTURES: write our encode of the p444 reference so the
 // local Pillow PSNR checker can score it against the same pristine source
 #[test]
