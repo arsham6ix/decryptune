@@ -39,7 +39,7 @@ except ImportError as _imp_err:
         raise ImportError(f"staged extension {_lib} failed to load: {_load_err}") from _load_err
     sys.modules[f"{__name__}.decryptune"] = _native  # register like a real submodule import
 
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
 
 
@@ -101,7 +101,8 @@ class DecrypTune:
         key: str | None = None,
         kid: str | None = None,
         meta: "TuneMeta | None" = None,
-        strict: bool = False
+        strict: bool = False,
+        classic: bool = False
     ) -> bytes | None:
         """Decrypt, fix, write metadata, and optionally guard — one pass.
 
@@ -117,12 +118,18 @@ class DecrypTune:
                  (JPEG/PNG); oversized JPEGs are downscaled to ≤1000px.
         - strict: when True (and key given), a fragment that decrypts to
                  statistical noise (fake/rotated key) raises error 8.
+        - classic: rewrite a fragmented (fMP4) result as a regular MP4 —
+                 real sample tables (stts/stsc/stsz/stco), one mdat, no moof/
+                 sidx/mvex; durations and edit lists are fixed. Audio data is
+                 copied, never re-encoded. A file without fragments passes
+                 through unchanged. Raises error 15 when the layout cannot be
+                 expressed as a classic MP4.
 
         Returns None when out is a path, bytes when out is None.
         All parameters are keyword-only.
         """
         try:
-            return self._lib.proc(input=input, out=out, key=key, kid=kid, meta=meta, strict=strict)
+            return self._lib.proc(input=input, out=out, key=key, kid=kid, meta=meta, strict=strict, classic=classic)
         except Exception as e:
             if (err := _to_err(e)) is not None:
                 raise err from None
@@ -136,7 +143,8 @@ class DecrypTune:
         key: str | None = None,
         kid: str | None = None,
         meta: "TuneMeta | None" = None,
-        strict: bool = False
+        strict: bool = False,
+        classic: bool = False
     ) -> bytes | None:
         """Async proc — same contract, keyword-only parameters.
 
@@ -147,7 +155,7 @@ class DecrypTune:
         blocks the event loop.
         """
         try:
-            return await self._lib.aproc(input=input, out=out, key=key, kid=kid, meta=meta, strict=strict)
+            return await self._lib.aproc(input=input, out=out, key=key, kid=kid, meta=meta, strict=strict, classic=classic)
         except Exception as e:
             if (err := _to_err(e)) is not None:
                 raise err from None
