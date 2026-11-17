@@ -278,7 +278,7 @@ fn proc<'py>(
                 wipe_key(&mut key);
                 check_strict(&fragments, guarded)?;
                 if classic {
-                    buf = defrag::defragment(&buf)?;
+                    buf = match defrag::defragment(&buf)? { Some(v) => v, None => buf };
                 }
                 write_atomic(&p, &buf)?;
                 Ok(())
@@ -295,7 +295,7 @@ fn proc<'py>(
                     let fragments: Vec<process::FragmentStat> =
                         process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
                     wipe_key(&mut key);
-                    let classic_buf: Vec<u8> = defrag::defragment(&buf)?;
+                    let classic_buf: Vec<u8> = match defrag::defragment(&buf)? { Some(v) => v, None => buf };
                     Ok((classic_buf, fragments))
                 },
             )?;
@@ -367,7 +367,7 @@ fn aproc<'py>(
                     wipe_key(&mut key);
                     check_strict(&fragments, guarded)?;
                     if classic {
-                        buf = defrag::defragment(&buf)?;
+                        buf = match defrag::defragment(&buf)? { Some(v) => v, None => buf };
                     }
                     write_atomic(&p, &buf)?;
                     Ok(())
@@ -384,7 +384,7 @@ fn aproc<'py>(
                         let fragments: Vec<process::FragmentStat> =
                             process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
                         wipe_key(&mut key);
-                        let classic_buf: Vec<u8> = defrag::defragment(&buf)?;
+                        let classic_buf: Vec<u8> = match defrag::defragment(&buf)? { Some(v) => v, None => buf };
                         Ok((classic_buf, fragments))
                     },
                 ).await.map_err(join_err)??;

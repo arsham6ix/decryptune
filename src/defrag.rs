@@ -8,7 +8,7 @@
 // checked against the 32-bit chunk-offset limit before anything is written.
 
 use crate::boxes::{header_len, parse, write_header, Box, MAX_BOXES};
-use crate::process::trex_defaults;
+use crate::process::{trex_defaults, MAX_TREE_DEPTH};
 use crate::Err;
 
 // containers the moov rebuild recurses into (mvex is dropped outright)
@@ -133,8 +133,11 @@ fn make_tables(chunks: &[ChunkRun], offsets: &[u32], durations: &[u32], sizes: &
 }
 
 // recursive moov rebuild — the only structural change is that mvex vanishes
-// and the sample tables inside stbl are appended fresh
-fn rebuild(data: &[u8], start: usize, end: usize, tables: &Tables, movie_duration: u64, media_duration: u64) -> Result<Vec<u8>, Err> {
+// and the sample tables inside stbl are appended fresh. Hostile container
+// nesting is depth-capped like the decrypt path's rebuild_container: without
+// the cap, nested boxes recurse to a stack overflow (uncatchable)
+fn rebuild(data: &[u8], start: usize, end: usize, tables: &Tables, movie_duration: u64, media_duration: u64, depth: usize) -> Result<Vec<u8>, Err> {
+    if depth > MAX_TREE_DEPTH { return Err(Err::ClassicUnsupported); }
     let children: Vec<Box> = parse(data, start, end);
     if children.len() >= MAX_BOXES { return Err(Err::ClassicUnsupported); }
     let mut out: Vec<u8> = Vec::new();
@@ -162,7 +165,7 @@ fn rebuild(data: &[u8], start: usize, end: usize, tables: &Tables, movie_duratio
                 out.extend_from_slice(&body);
             }
             b"stbl" => {
-                let mut inner: Vec<u8> = rebuild(data, b.content_start, b.end, tables, movie_duration, media_duration)?;
+                let mut inner: Vec<u8> = rebuild(data, b.content_start, b.end, tables, movie_duration, media_duration, depth + 1)?;
                 // the Tables fields hold box BODIES — wrap each in its header
                 write_header(&mut inner, b"stts", tables.stts.len());
                 inner.extend_from_slice(&tables.stts);
@@ -176,7 +179,7 @@ fn rebuild(data: &[u8], start: usize, end: usize, tables: &Tables, movie_duratio
                 out.extend_from_slice(&inner);
             }
             typ if CONTAINERS.iter().any(|c| c == &typ) => {
-                let inner: Vec<u8> = rebuild(data, b.content_start, b.end, tables, movie_duration, media_duration)?;
+                let inner: Vec<u8> = rebuild(data, b.content_start, b.end, tables, movie_duration, media_duration, depth + 1)?;
                 write_header(&mut out, typ, inner.len());
                 out.extend_from_slice(&inner);
             }
@@ -186,13 +189,16 @@ fn rebuild(data: &[u8], start: usize, end: usize, tables: &Tables, movie_duratio
     Ok(out)
 }
 
-/// Rewrite fragmented MP4 bytes as a classic MP4. A file without moof boxes
-/// is already classic and returns unchanged.
-pub(crate) fn defragment(data: &[u8]) -> Result<Vec<u8>, Err> {
+/// Rewrite fragmented MP4 bytes as a classic MP4. `None` means the input has
+/// no moof boxes — already classic — and no rewrite buffer is needed.
+pub(crate) fn defragment(data: &[u8]) -> Result<Option<Vec<u8>>, Err> {
     let top: Vec<Box> = parse(data, 0, data.len());
     if top.is_empty() || top.len() >= MAX_BOXES { return Err(Err::ClassicUnsupported); }
-    if !top.iter().any(|b| b.is(b"moof")) { return Ok(data.to_vec()); }
+    if !top.iter().any(|b| b.is(b"moof")) { return Ok(None); }
     let moov: &Box = top.iter().find(|b| b.is(b"moov")).ok_or(Err::ClassicUnsupported)?;
+    if top.iter().filter(|b| b.is(b"moov")).count() != 1 {
+        return Err(Err::ClassicUnsupported); // duplicate moovs would corrupt the offset math
+    }
     let children: Vec<Box> = parse(data, moov.content_start, moov.end);
     if children.len() >= MAX_BOXES || children.iter().filter(|b| b.is(b"trak")).count() != 1 {
         return Err(Err::ClassicUnsupported);
@@ -215,13 +221,15 @@ pub(crate) fn defragment(data: &[u8]) -> Result<Vec<u8>, Err> {
     let mut chunks: Vec<ChunkRun> = Vec::new();
     for moof in top.iter().filter(|b| b.is(b"moof")) {
         let moof_children: Vec<Box> = parse(data, moof.content_start, moof.end);
+        // a trun without data_offset continues the PREVIOUS run's data, chaining
+        // across trafs of the same moof — so `next` lives at the moof level
+        let mut next: Option<usize> = None;
         for traf in &moof_children {
             if !traf.is(b"traf") { continue; }
             let subs: Vec<Box> = parse(data, traf.content_start, traf.end);
             let mut base: usize = moof.start;
             let mut dur: u32 = trex.map(|(d, _)| d).unwrap_or(0);
             let mut size: u32 = trex.map(|(_, s)| s).unwrap_or(0);
-            let mut next: Option<usize> = None;
             for sub in &subs {
                 match &sub.typ {
                     b"tfhd" => {
@@ -284,19 +292,27 @@ pub(crate) fn defragment(data: &[u8]) -> Result<Vec<u8>, Err> {
     if sizes.is_empty() { return Err(Err::ClassicUnsupported); }
     let media_duration: u64 = durations.iter().map(|d| u64::from(*d)).sum();
     if media_duration == 0 { return Err(Err::ClassicUnsupported); }
-    let movie_duration: u64 = media_duration * u64::from(movie_ts) / u64::from(media_ts);
+    // hostile timescales/durations can overflow the u64 product — the u128
+    // intermediate keeps it exact (the result itself always fits: it is at
+    // most media_duration, which came out of a u64 sum)
+    let movie_duration: u64 =
+        ((media_duration as u128 * u128::from(movie_ts)) / u128::from(media_ts)) as u64;
 
     // moov's size does not depend on the offset VALUES — size it with dummy
     // offsets first, then place the data and rebuild with the real ones
     let zeros: Vec<u32> = vec![0u32; chunks.len()];
     let dummy: Tables = make_tables(&chunks, &zeros, &durations, &sizes);
-    let placeholder: Vec<u8> = rebuild(data, moov.content_start, moov.end, &dummy, movie_duration, media_duration)?;
+    let placeholder: Vec<u8> = rebuild(data, moov.content_start, moov.end, &dummy, movie_duration, media_duration, 0)?;
     let others_len: usize = top.iter()
         .filter(|b| !matches!(&b.typ, b"moof" | b"mdat" | b"sidx" | b"moov"))
         .map(|b| b.end - b.start)
         .sum();
     let data_start: usize = others_len + header_len(placeholder.len()) + placeholder.len() + 8; // moov box + mdat header
     let total_audio: usize = chunks.iter().map(|c| c.len).sum();
+    // legit sample bytes are a subset of the input (disjoint runs), so the
+    // total can never exceed it — overlapping runs are malformed, and the cap
+    // also bounds the output allocation against hostile amplification
+    if total_audio > data.len() { return Err(Err::ClassicUnsupported); }
     if data_start + total_audio > u32::MAX as usize {
         return Err(Err::ClassicUnsupported); // stco holds u32 offsets only (audio never gets there)
     }
@@ -307,7 +323,7 @@ pub(crate) fn defragment(data: &[u8]) -> Result<Vec<u8>, Err> {
         pos += c.len;
     }
     let tables: Tables = make_tables(&chunks, &offsets, &durations, &sizes);
-    let new_moov: Vec<u8> = rebuild(data, moov.content_start, moov.end, &tables, movie_duration, media_duration)?;
+    let new_moov: Vec<u8> = rebuild(data, moov.content_start, moov.end, &tables, movie_duration, media_duration, 0)?;
     if new_moov.len() != placeholder.len() { return Err(Err::ClassicUnsupported); } // cannot happen — table sizes are value-independent
 
     // unknown top-level boxes (free, top-level meta…) are kept verbatim;
@@ -327,5 +343,5 @@ pub(crate) fn defragment(data: &[u8]) -> Result<Vec<u8>, Err> {
     for c in &chunks {
         out.extend_from_slice(&data[c.offset..c.offset + c.len]);
     }
-    Ok(out)
+    Ok(Some(out))
 }

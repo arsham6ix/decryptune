@@ -58,9 +58,11 @@ def make_senc(ivs):
     return full_box(b"senc", 0, 0, body)
 
 
-def make_trun(sizes, data_offset, with_sizes=True, durations=None):
-    flags = 0x1 | (0x200 if with_sizes else 0) | (0x100 if durations else 0)
-    body = u32(len(sizes)) + i32(data_offset)
+def make_trun(sizes, data_offset, with_sizes=True, durations=None, with_offset=True):
+    flags = (0x1 if with_offset else 0) | (0x200 if with_sizes else 0) | (0x100 if durations else 0)
+    body = u32(len(sizes))
+    if with_offset:
+        body += i32(data_offset)
     for i in range(len(sizes)):
         if durations:
             body += u32(durations[i])
@@ -435,6 +437,106 @@ def test_classic_aproc_parity(sp):
     data, _ = build_classic_source()
     out = asyncio.run(sp.aproc(input=data, key=KEY_HEX, classic=True))
     assert out == sp.proc(input=data, key=KEY_HEX, classic=True)
+
+
+def test_classic_moov_first(sp):
+    """The real-file layout: moov FIRST, then the fragments (moov-at-end was
+    the only shape the earlier tests covered — a typo in the fragment walk
+    silently produced empty sample tables there and only broke moov-first
+    files, i.e. every real track)."""
+    data, plain = build_classic_source()
+    ftyp = find(data, b"ftyp")[0]
+    moov = find(data, b"moov")[0]
+    moofs, mdats = find(data, b"moof"), find(data, b"mdat")
+    reordered = (data[ftyp[1]:ftyp[1] + ftyp[2]] + data[moov[1]:moov[1] + moov[2]] +
+                 b"".join(data[m[1]:m[1] + m[2]] + data[d[1]:d[1] + d[2]] for m, d in zip(moofs, mdats)))
+    out = sp.proc(input=reordered, key=KEY_HEX, strict=True, classic=True)
+    mdat = find(out, b"mdat")[0]
+    assert out[mdat[1] + 8:mdat[1] + mdat[2]] == b"".join(plain) * 2
+    moov2 = find(out, b"moov")[0]
+    stco = find_deep(out, moov2[1], moov2[1] + moov2[2], b"stco")
+    assert stco is not None
+    (count,) = struct.unpack_from(">I", out, stco[0] + 12)
+    assert count == 2
+
+
+def test_error_classic_unsupported(sp):
+    """A fragmented layout the rewrite cannot express raises coded error 15 —
+    wrapped as DecrypTuneError like every other native code (the [N] relay
+    range must cover it)."""
+    size = 20000
+    moof = make_moof(1, [make_tfhd(), make_trun([size] * 2, 0)])
+    data = (box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") +
+            set_offset(moof, 99999999) + box(b"mdat", bytes(size * 2)) + make_moov())  # data outside the file
+    try:
+        sp.proc(input=data, classic=True)
+        raise AssertionError("classic rewrite accepted impossible offsets")
+    except DecrypTuneError as e:
+        assert e.code == 15, e
+
+
+def test_classic_chained_trafs(sp):
+    """A trun without data_offset continues the previous run's data, chaining
+    across trafs of the same moof (ISO 14496-12) — the second traf here relies
+    on it. Without the moof-level chain this layout was refused with error 15."""
+    size, dur = 20000, 1024
+    blob = bytes([(0x33 + i) & 0xFF for i in range(size * 4)])  # 4 samples × 20000
+    traf1 = box(b"traf", make_tfhd(default_duration=dur) +
+                make_trun([size] * 2, 0, durations=[dur] * 2))   # offset patched below
+    traf2 = box(b"traf", make_tfhd(default_duration=dur) +
+                make_trun([size] * 2, 0, durations=[dur] * 2, with_offset=False))
+    moof = box(b"moof", full_box(b"mfhd", 0, 0, u32(1)) + traf1 + traf2)
+    moof = set_offset(moof, len(moof) + 8)  # traf1's run starts at the mdat content
+    data = (box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") +
+            moof + box(b"mdat", blob) + make_moov())
+    out = sp.proc(input=data, classic=True)
+    mdat = find(out, b"mdat")[0]
+    assert out[mdat[1] + 8:mdat[1] + mdat[2]] == blob  # both trafs' samples, in order
+    moov = find(out, b"moov")[0]
+    stco = find_deep(out, moov[1], moov[1] + moov[2], b"stco")
+    (count,) = struct.unpack_from(">I", out, stco[0] + 12)
+    assert count == 2
+    assert struct.unpack_from(">II", out, stco[0] + 16) == (mdat[1] + 8, mdat[1] + 8 + 40000)
+
+
+def test_classic_deep_nesting_rejected(sp):
+    """Deeply nested containers would recurse the rewrite to a stack overflow
+    (uncatchable SIGSEGV) — the depth guard refuses them exactly like the
+    decrypt path's rebuild_container. The nest is built in O(n): each level
+    prepends an 8-byte trak header, so level k is k concatenated headers."""
+    moov = make_moov()
+    trak_pos = 8 + 108                       # moov header + the 108-byte mvhd
+    (trak_size,) = struct.unpack_from(">I", moov, trak_pos)
+    n = 100_000
+    nested = b"".join(u32(8 * k) + b"trak" for k in range(n, 0, -1))
+    moov = (moov[:trak_pos] + u32(trak_size + len(nested)) + moov[trak_pos + 4:trak_pos + 8] +
+            nested + moov[trak_pos + 8:])
+    (moov_size,) = struct.unpack_from(">I", moov, 0)
+    moov = u32(moov_size + len(nested)) + moov[4:]
+    data = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") + make_moof(1, [make_tfhd(), make_trun([2048] * 2, 0)]) + box(b"mdat", bytes(4096)) + moov
+    try:
+        sp.proc(input=data, classic=True)
+        raise AssertionError("deep nesting accepted")
+    except DecrypTuneError as e:
+        assert e.code == 15, e
+
+
+def test_classic_overlapping_chunks_rejected(sp):
+    """Hostile truns can all reference the same byte range — the summed output
+    used to inflate toward the 32-bit cap and force a huge allocation. Legit
+    sample bytes never exceed the input, so overlap is rejected."""
+    moofs = []
+    for seq in range(500):
+        m = make_moof(seq + 1, [make_tfhd(default_size=4096, default_duration=1024),
+                                make_trun([4096] * 64, 0, with_sizes=False)])
+        moofs.append(set_offset(m, 100))     # every fragment claims the same bytes
+    ftyp = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom")
+    data = ftyp + b"".join(moofs) + make_moov()
+    try:
+        sp.proc(input=data, classic=True)
+        raise AssertionError("overlapping chunks accepted")
+    except DecrypTuneError as e:
+        assert e.code == 15, e
 
 
 # ---- fixtures ---------------------------------------------------------------

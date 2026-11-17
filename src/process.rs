@@ -10,7 +10,7 @@ use crate::Err;
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
 const CONTAINERS: &[&[u8; 4]] = &[b"moov", b"trak", b"mdia", b"minf", b"stbl"];
-const MAX_TREE_DEPTH: usize = 16;
+pub(crate) const MAX_TREE_DEPTH: usize = 16;
 // chi2 thresholds calibrated on real AAC tracks (structured ~3800..14000 at
 // 16KB, ~950+ at 4KB; noise is df-bound at ~210..340 for any size above ~1KB,
 // so 500 splits clean from corrupt with margin on both sides down to 4KB)
