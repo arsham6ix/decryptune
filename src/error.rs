@@ -20,7 +20,8 @@ pub(crate) enum Err {
     MetaNeedsFragmented = 11,
     BadCover            = 12,
     CoverNotFound       = 13, // additive: a missing cover path must not read as a missing input
-    CoverTooLarge       = 14  // additive: an absurd cover must not flow into the ilst whole
+    CoverTooLarge       = 14, // additive: an absurd cover must not flow into the ilst whole
+    ClassicUnsupported  = 15  // additive: a fragmented layout the classic rewrite cannot express
 }
 
 impl Err {
@@ -39,7 +40,8 @@ impl Err {
             Err::BadOutput           => "invalid out: expected a path or None",
             Err::MetaNeedsFragmented => "metadata write requires a fragmented file (non-empty chunk offsets)",
             Err::BadCover            => "unsupported cover format: expected JPEG or PNG",
-            Err::CoverTooLarge       => "cover too large (max 32 MB)"
+            Err::CoverTooLarge       => "cover too large (max 32 MB)",
+            Err::ClassicUnsupported  => "cannot rewrite as a classic mp4 (unsupported or malformed fragmented layout)"
         }
     }
 }

@@ -58,18 +58,26 @@ def make_senc(ivs):
     return full_box(b"senc", 0, 0, body)
 
 
-def make_trun(sizes, data_offset, with_sizes=True):
-    flags = 0x1 | (0x200 if with_sizes else 0)
+def make_trun(sizes, data_offset, with_sizes=True, durations=None):
+    flags = 0x1 | (0x200 if with_sizes else 0) | (0x100 if durations else 0)
     body = u32(len(sizes)) + i32(data_offset)
-    if with_sizes:
-        body += b"".join(u32(s) for s in sizes)
+    for i in range(len(sizes)):
+        if durations:
+            body += u32(durations[i])
+        if with_sizes:
+            body += u32(sizes[i])
     return full_box(b"trun", 0, flags, body)
 
 
-def make_tfhd(default_size=None):
-    if default_size is None:
-        return full_box(b"tfhd", 0, 0, u32(1))                       # track_ID only
-    return full_box(b"tfhd", 0, 0x10, u32(1) + u32(default_size))    # + default_sample_size
+def make_tfhd(default_size=None, default_duration=None):
+    payload, flags = u32(1), 0
+    if default_duration is not None:                      # 0x8 precedes 0x10 per spec
+        flags |= 0x8
+        payload += u32(default_duration)
+    if default_size is not None:
+        flags |= 0x10
+        payload += u32(default_size)
+    return full_box(b"tfhd", 0, flags, payload)
 
 
 def make_saiz(count):
@@ -84,6 +92,17 @@ def make_moof(seq, traf_children):
     mfhd = full_box(b"mfhd", 0, 0, u32(seq))
     traf = box(b"traf", b"".join(traf_children))
     return box(b"moof", mfhd + traf)
+
+
+def set_offset(moof, off):
+    """Point the first trun's data_offset at a byte position (relative to moof start)."""
+    i = moof.find(b"trun")           # position of the type string
+    return moof[:i + 12] + i32(off) + moof[i + 16:]
+
+
+def make_trex(default_size=0):
+    # ver/flags + track_ID + default_sample_description_index + duration + size
+    return full_box(b"trex", 0, 0, u32(1) + u32(0) + u32(0) + u32(default_size))
 
 
 def make_esds():
@@ -121,7 +140,7 @@ def make_stsd():
     return full_box(b"stsd", 0, 0, body)
 
 
-def make_moov():
+def make_moov(extra=b""):
     mvhd = full_box(b"mvhd", 0, 0,
         u32(0) + u32(0) + u32(1000) + u32(12000) + u32(0x10000) +
         u16(0x0100) + u16(0) + bytes(8) + bytes(36) + bytes(24) + u32(2))
@@ -142,7 +161,7 @@ def make_moov():
     mdia = box(b"mdia", mdhd + hdlr + minf)
     trak = box(b"trak", tkhd + mdia)
     pssh = full_box(b"pssh", 0, 0, bytes(16) + u32(0) + u32(0))
-    return box(b"moov", mvhd + trak + pssh)
+    return box(b"moov", mvhd + trak + pssh + extra)
 
 
 def make_sidx(ref_sizes):
@@ -172,10 +191,6 @@ def build_sample_file():
     enc = [ctr_crypt(KEY, ivs[i], plain[i]) for i in range(n)]
 
     # trun data_offset: first byte of sample data relative to moof start
-    def set_offset(moof, off):
-        i = moof.find(b"trun")           # position of the type string
-        return moof[:i + 12] + i32(off) + moof[i + 16:]
-
     moof1 = make_moof(1, [make_tfhd(), make_trun(sizes, 0), make_senc(ivs),
                           make_saiz(n), make_saio()])
     moof2 = make_moof(2, [make_tfhd(), make_trun(sizes, 0)])
@@ -311,6 +326,115 @@ def assert_decrypted(out, expected_plain):
     assert b"pssh" not in mc
     assert b"enca" not in mc and b"sinf" not in mc and b"frma" not in mc
     assert b"mp4a" in mc and b"esds" in mc
+
+
+def test_trex_default_size_decrypts(sp):
+    """Sample sizes declared only in mvex/trex must still decrypt — the ISO
+    default cascade is trex (file) → tfhd (fragment) → trun (per entry), and
+    CMAF/DASH muxers rely on the trex layer. Before the fix such fragments
+    produced zero-size samples and silently passed through unencrypted."""
+    n, size = 4, 20000
+    iv = bytes([9, 0xA, 3, 4, 5, 6, 7, 8])
+    chunks = [bytes([(0x11 * (i + 1)) & 0xFF]) * size for i in range(n)]  # distinct per sample
+    enc = b"".join(ctr_crypt(KEY, iv, c) for c in chunks)
+    plain = b"".join(chunks)
+    moof = make_moof(1, [make_tfhd(), make_trun([size] * n, 0, with_sizes=False), make_senc([iv] * n)])
+    moof = set_offset(moof, len(moof) + 8)
+    mvex = box(b"mvex", make_trex(default_size=size))
+    data = (box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom") +
+            moof + box(b"mdat", enc) + make_moov(extra=mvex))
+    out = sp.proc(input=data, key=KEY_HEX, strict=True)
+    frag = find(out, b"moof")[0]
+    content = out[frag[1] + 8:frag[1] + frag[2]]
+    assert b"senc" not in content
+    mdat = find(out, b"mdat")[0]
+    assert out[mdat[1] + 8:mdat[1] + mdat[2]] == plain
+
+
+def build_classic_source():
+    """ftyp + [enc frag] + [plain frag] + moov with explicit durations/sizes —
+    material for the classic rewrite (both fragments carry 4 × 20000B samples)."""
+    ftyp = box(b"ftyp", b"M4A " + u32(0) + b"M4A " + b"mp42" + b"isom")
+    n, size, dur = 4, 20000, 1024
+    plain = [bytes([(0x21 * i) & 0xFF]) * size for i in range(1, n + 1)]
+    ivs = [bytes([j, 0xB, 1, 2, 3, 4, 5, 6]) for j in range(n)]
+    enc = [ctr_crypt(KEY, ivs[i], plain[i]) for i in range(n)]
+    moof1 = make_moof(1, [make_tfhd(default_duration=dur), make_trun([size] * n, 0, durations=[dur] * n), make_senc(ivs)])
+    moof2 = make_moof(2, [make_tfhd(default_duration=dur), make_trun([size] * n, 0, durations=[dur] * n)])
+    moof1 = set_offset(moof1, len(moof1) + 8)
+    moof2 = set_offset(moof2, len(moof2) + 8)
+    data = ftyp + moof1 + box(b"mdat", b"".join(enc)) + moof2 + box(b"mdat", b"".join(plain)) + make_moov()
+    return data, plain
+
+
+def find_deep(d, start, end, typ):
+    """Recursively search a moov subtree; return (pos, size) of the first match."""
+    pos = start
+    while pos + 8 <= end:
+        (size,) = struct.unpack_from(">I", d, pos)
+        t = d[pos + 4:pos + 8]
+        if size == 0:
+            size = end - pos
+        if size < 8 or pos + size > end:
+            return None
+        if t == typ:
+            return pos, size
+        if t in (b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts"):
+            hit = find_deep(d, pos + 8, pos + size, typ)
+            if hit:
+                return hit
+        pos += size
+    return None
+
+
+def has_box(d, start, end, typ):
+    return find_deep(d, start, end, typ) is not None
+
+
+def test_classic_rewrite(sp):
+    """classic=True folds the fragments into a regular MP4: real sample
+    tables, one mdat, no moof/mvex — byte-identical audio, playable by
+    taggers that only understand classic MP4."""
+    data, plain = build_classic_source()
+    out = sp.proc(input=data, key=KEY_HEX, strict=True, classic=True)
+    top = [t for t, _, _ in walk(out)]
+    assert b"moof" not in top and b"sidx" not in top
+    assert top.count(b"mdat") == 1
+    mdat = find(out, b"mdat")[0]
+    assert out[mdat[1] + 8:mdat[1] + mdat[2]] == b"".join(plain) * 2
+
+    moov = find(out, b"moov")[0]
+    assert not has_box(out, moov[1], moov[1] + moov[2], b"mvex")
+    assert not has_box(out, moov[1], moov[1] + moov[2], b"pssh")
+    for tbl in (b"stts", b"stsc", b"stsz", b"stco"):
+        assert has_box(out, moov[1], moov[1] + moov[2], tbl), tbl
+    # mvhd v0 duration = 8 samples × 1024 @44100 in the 1000 movie timescale
+    (mvhd_dur,) = struct.unpack_from(">I", out, moov[1] + 8 + 8 + 16)  # moov hdr(8) + mvhd hdr(8) + ver/flags(4) + creation(4) + modification(4)
+    assert mvhd_dur == 8 * 1024 * 1000 // 44100
+    # the two chunk offsets point exactly at the mdat content
+    stco = find_deep(out, moov[1], moov[1] + moov[2], b"stco")
+    assert stco is not None
+    (count,) = struct.unpack_from(">I", out, stco[0] + 12)
+    assert count == 2
+    assert struct.unpack_from(">II", out, stco[0] + 16) == (mdat[1] + 8, mdat[1] + 8 + 80000)
+    # mdhd v0 duration = 8 × 1024 in the 44100 media timescale (mutagen is
+    # not used here — the synthetic esds descriptor is a toy it rejects)
+    mdhd = find_deep(out, moov[1], moov[1] + moov[2], b"mdhd")
+    (mdhd_dur,) = struct.unpack_from(">I", out, mdhd[0] + 8 + 16)
+    assert mdhd_dur == 8 * 1024
+
+
+def test_classic_passthrough_on_classic_input(sp):
+    """A file without moof boxes is already classic — classic=True must be a no-op."""
+    data, _ = build_classic_source()
+    classic = sp.proc(input=data, key=KEY_HEX, classic=True)
+    assert sp.proc(input=classic) == sp.proc(input=classic, classic=True)
+
+
+def test_classic_aproc_parity(sp):
+    data, _ = build_classic_source()
+    out = asyncio.run(sp.aproc(input=data, key=KEY_HEX, classic=True))
+    assert out == sp.proc(input=data, key=KEY_HEX, classic=True)
 
 
 # ---- fixtures ---------------------------------------------------------------

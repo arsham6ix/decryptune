@@ -76,6 +76,8 @@ pub fn build(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&Co
 fn walk(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&CoreMeta>, out: &mut Writer<'_>) -> Result<Vec<Job>, Err> {
     let boxes: Vec<Box> = parse(data, 0, data.len());
     if boxes.is_empty() || boxes.len() >= MAX_BOXES { return Err(Err::InvalidMp4); }
+    let trex_size: Option<u32> = trex_defaults(data, &boxes)
+        .and_then(|(_, sz)| if sz == 0 { None } else { Some(sz) });
 
     let mut deltas: Vec<i64> = Vec::new();
     let mut patches: Vec<(usize, Vec<usize>)> = Vec::new(); // (frag base, sidx word offsets)
@@ -89,7 +91,7 @@ fn walk(data: &[u8], key: Option<&[u8; 16]>, strict: bool, meta: Option<&CoreMet
         match &b.typ {
             b"moof" => {
                 flush(out, data, &mut pending);
-                let plan: Plan = visit_moof(out, data, b);
+                let plan: Plan = visit_moof(out, data, b, trex_size);
                 deltas.push((b.end - b.start) as i64 - plan.rebuilt_len as i64);
                 if i + 1 < boxes.len() && boxes[i + 1].is(b"mdat") {
                     if let Some(job) = stage_mdat(out, data, &boxes[i + 1], plan, key, strict, unpaired_moof) {
@@ -156,7 +158,7 @@ fn flush(out: &mut Writer<'_>, data: &[u8], pending: &mut Option<Range<usize>>) 
     if let Some(r) = pending.take() { out.put(&data[r.start..r.end]); }
 }
 
-fn visit_moof(out: &mut Writer<'_>, data: &[u8], b: &Box) -> Plan {
+fn visit_moof(out: &mut Writer<'_>, data: &[u8], b: &Box, trex_size: Option<u32>) -> Plan {
     let mut content: Vec<u8> = Vec::new();
     let mut ivs: Option<Vec<[u8; 16]>> = None;
     let mut sizes: Vec<u32> = Vec::new();
@@ -172,10 +174,13 @@ fn visit_moof(out: &mut Writer<'_>, data: &[u8], b: &Box) -> Plan {
         let traf: Vec<Box> = parse(data, child.content_start, child.end);
 
         // gather: tfhd default first so trun fallback works in any order
-        // (a saturated child count means box spam — nothing to decrypt)
+        // (a saturated child count means box spam — nothing to decrypt);
+        // the mvex/trex file default fills whatever tfhd leaves unset
         if traf.len() >= MAX_BOXES { oversized = true; }
         default_size = traf.iter().find(|t| t.is(b"tfhd"))
-            .and_then(|t| parse_tfhd(data, t.content_start, t.end));
+            .and_then(|t| parse_tfhd(data, t.content_start, t.end))
+            .filter(|v| *v != 0)
+            .or(trex_size);
         for t in &traf {
             match &t.typ {
                 b"senc" if ivs.is_none() => {
@@ -523,6 +528,26 @@ fn has_chunk_offsets(children: &[u8], depth: usize) -> bool {
         }
     }
     false
+}
+
+// file-level sample defaults from the first mvex/trex — the ISO 14496-12
+// cascade is trex (file) → tfhd (fragment) → trun (per entry), and CMAF/DASH
+// muxers rely on the trex layer. Scope: the first trex — the fragmented
+// surface here is single-audio-track. 0 means "unspecified" per spec
+pub(crate) fn trex_defaults(data: &[u8], top: &[Box]) -> Option<(u32, u32)> {
+    let moov: &Box = top.iter().find(|b| b.is(b"moov"))?;
+    for child in parse(data, moov.content_start, moov.end) {
+        if !child.is(b"mvex") { continue; }
+        for t in parse(data, child.content_start, child.end) {
+            if t.is(b"trex") && t.content_start + 20 <= t.end {
+                // ver/flags(4) track_ID(4) desc_index(4) duration(4) size(4)
+                let d: u32 = u32::from_be_bytes(data[t.content_start + 12..t.content_start + 16].try_into().unwrap());
+                let s: u32 = u32::from_be_bytes(data[t.content_start + 16..t.content_start + 20].try_into().unwrap());
+                return Some((d, s));
+            }
+        }
+    }
+    None
 }
 
 // default_sample_size from tfhd (flag 0x10), honoring preceding optional fields;

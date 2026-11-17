@@ -30,8 +30,10 @@ sp.proc(
         # date=..., album=..., genre=..., lyrics=..., composer=...,
         # track=..., track_total=..., disc=..., disc_total=...
     ),
-    strict=True                  # raise (code 8, per-fragment chi² evidence) when a fragment
-)                                # decrypts to statistical noise — a wrong/fake key
+    strict=True,                 # raise (code 8, per-fragment chi² evidence) when a fragment
+                                 # decrypts to statistical noise — a wrong/fake key
+    classic=True                 # rewrite a fragmented (fMP4) result as a regular MP4 —
+)                                # real sample tables, one mdat; audio is copied, not re-encoded
 
 # async twin — same options, same result:
 out_bytes = await sp.aproc(...)
@@ -43,7 +45,7 @@ Rules that hold for both `proc` and `aproc`:
 - `out` is a path → the file is written **atomically** (tmp + rename) and `None` is returned; `out` is `None` → the processed `bytes` are returned.
 - `key=None` → **fix-only pass**: headers sanitized, audio payload untouched.
 - A `meta` **wipes** the existing tag block and rebuilds it solely from the given fields — `None` / `0` / empty values are skipped; without `meta` the original metadata passes through untouched.
-- Any problem raises `DecrypTuneError` with a stable numeric code (1–14) and a message authored in the native core: `1` invalid key · `2` invalid kid · `3` input not found · `4` not an MP4 · `6` write failed · `7` KID mismatch · `8` corrupt audio detected · `9` bad input type · `10` bad out type · `11` tags need a fragmented file · `12` bad cover · `13` cover file not found · `14` cover too large (max 32 MB).
+- Any problem raises `DecrypTuneError` with a stable numeric code (1–15) and a message authored in the native core: `1` invalid key · `2` invalid kid · `3` input not found · `4` not an MP4 · `6` write failed · `7` KID mismatch · `8` corrupt audio detected · `9` bad input type · `10` bad out type · `11` tags need a fragmented file · `12` bad cover · `13` cover file not found · `14` cover too large (max 32 MB) · `15` classic rewrite unsupported.
 
 ## Benchmark
 

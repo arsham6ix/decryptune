@@ -1,5 +1,6 @@
 mod boxes;
 mod cover;
+mod defrag;
 mod error;
 mod input;
 mod jpeg;
@@ -173,19 +174,21 @@ impl TuneMeta {
 }
 
 fn parse_args(
-    py   : Python<'_>,
-    input: &Bound<'_, PyAny>,
-    out  : Option<&Bound<'_, PyAny>>,
-    key  : Option<&str>,
-    kid  : Option<&str>,
-    meta : Option<&TuneMeta>
+    py     : Python<'_>,
+    input  : &Bound<'_, PyAny>,
+    out    : Option<&Bound<'_, PyAny>>,
+    key    : Option<&str>,
+    kid    : Option<&str>,
+    meta   : Option<&TuneMeta>,
+    classic: bool
 ) -> PyResult<Args> {
     Ok(Args {
         input    : parse_input(input)?,
         output   : parse_output(out)?,
         key      : key.map(parse_hex16).transpose()?,
         kid      : kid.map(|s| s.to_string()),
-        core_meta: resolve_meta(py, meta)?
+        core_meta: resolve_meta(py, meta)?,
+        classic
     })
 }
 
@@ -196,15 +199,16 @@ struct Args {
     output   : Output,
     key      : Option<[u8; 16]>,
     kid      : Option<String>,
-    core_meta: Option<meta::CoreMeta>
+    core_meta: Option<meta::CoreMeta>,
+    classic  : bool
 }
 
-type ParsedArgs = (input::Input, Output, Option<[u8; 16]>, Option<String>, Option<meta::CoreMeta>, bool);
+type ParsedArgs = (input::Input, Output, Option<[u8; 16]>, Option<String>, Option<meta::CoreMeta>, bool, bool);
 
 impl Args {
     fn into_parts(self) -> ParsedArgs {
         let has_key: bool = self.key.is_some();
-        (self.input, self.output, self.key, self.kid, self.core_meta, has_key)
+        (self.input, self.output, self.key, self.kid, self.core_meta, has_key, self.classic)
     }
 }
 
@@ -247,7 +251,8 @@ fn resolve_meta(py: Python<'_>, meta: Option<&TuneMeta>) -> PyResult<Option<meta
 // Decrypt, fix, write metadata, optionally guard against fake keys — one pass.
 // All parameters keyword-only; returns None (path out) or bytes (no out).
 #[pyfunction]
-#[pyo3(signature = (*, input, out=None, key=None, kid=None, meta=None, strict=false))]
+#[allow(clippy::too_many_arguments)] // the keyword-only signature is the public API
+#[pyo3(signature = (*, input, out=None, key=None, kid=None, meta=None, strict=false, classic=false))]
 fn proc<'py>(
     py     : Python<'py>,
     input  : &Bound<'py, PyAny>,
@@ -255,9 +260,10 @@ fn proc<'py>(
     key    : Option<&str>,
     kid    : Option<&str>,
     meta   : Option<&TuneMeta>,
-    strict : bool
+    strict : bool,
+    classic: bool
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let (input, output, key, kid, core_meta, has_key): ParsedArgs = parse_args(py, input, out, key, kid, meta)?.into_parts();
+    let (input, output, key, kid, core_meta, has_key, classic): ParsedArgs = parse_args(py, input, out, key, kid, meta, classic)?.into_parts();
     let (data, len, core_meta): (InputData, usize, Option<meta::CoreMeta>) =
         py.detach(move || load_and_measure(input, has_key, kid, core_meta)).map_err(PyErr::from)?;
     let guarded: bool = strict && key.is_some();
@@ -271,10 +277,31 @@ fn proc<'py>(
                     process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
                 wipe_key(&mut key);
                 check_strict(&fragments, guarded)?;
+                if classic {
+                    buf = defrag::defragment(&buf)?;
+                }
                 write_atomic(&p, &buf)?;
                 Ok(())
             })?;
             Ok(None)
+        }
+        Output::Return if classic => {
+            // the classic rewrite changes the length, so the zero-copy path
+            // does not apply — build into a Vec, rewrite, then hand out bytes
+            let (final_buf, fragments): (Vec<u8>, Vec<process::FragmentStat>) = py.detach(
+                move || -> PyResult<(Vec<u8>, Vec<process::FragmentStat>)> {
+                    let mut key: Option<[u8; 16]> = key;
+                    let mut buf: Vec<u8> = vec![0u8; len];
+                    let fragments: Vec<process::FragmentStat> =
+                        process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
+                    wipe_key(&mut key);
+                    let classic_buf: Vec<u8> = defrag::defragment(&buf)?;
+                    Ok((classic_buf, fragments))
+                },
+            )?;
+            check_strict(&fragments, guarded)?;
+            let bytes: Bound<'py, PyBytes> = PyBytes::new(py, &final_buf);
+            Ok(Some(bytes.into_any()))
         }
         Output::Return => {
             // build straight into the freshly allocated Python bytes — no
@@ -309,7 +336,8 @@ fn join_err(join: tokio::task::JoinError) -> PyErr {
 
 // async twin of proc: native coroutine, CPU work off-GIL, async file writes
 #[pyfunction]
-#[pyo3(signature = (*, input, out=None, key=None, kid=None, meta=None, strict=false))]
+#[allow(clippy::too_many_arguments)] // the keyword-only signature is the public API
+#[pyo3(signature = (*, input, out=None, key=None, kid=None, meta=None, strict=false, classic=false))]
 fn aproc<'py>(
     py     : Python<'py>,
     input  : &Bound<'py, PyAny>,
@@ -317,9 +345,10 @@ fn aproc<'py>(
     key    : Option<&str>,
     kid    : Option<&str>,
     meta   : Option<&TuneMeta>,
-    strict : bool
+    strict : bool,
+    classic: bool
 ) -> PyResult<Bound<'py, PyAny>> {
-    let (input, output, key, kid, core_meta, has_key): ParsedArgs = parse_args(py, input, out, key, kid, meta)?.into_parts();
+    let (input, output, key, kid, core_meta, has_key, classic): ParsedArgs = parse_args(py, input, out, key, kid, meta, classic)?.into_parts();
     let guarded: bool = strict && key.is_some();
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -337,10 +366,31 @@ fn aproc<'py>(
                         process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
                     wipe_key(&mut key);
                     check_strict(&fragments, guarded)?;
+                    if classic {
+                        buf = defrag::defragment(&buf)?;
+                    }
                     write_atomic(&p, &buf)?;
                     Ok(())
                 }).await.map_err(join_err)??;
                 Ok(None)
+            }
+            Output::Return if classic => {
+                // the classic rewrite changes the length — build into a Vec,
+                // rewrite, then hand out fresh bytes
+                let (final_buf, fragments): (Vec<u8>, Vec<process::FragmentStat>) = tokio::task::spawn_blocking(
+                    move || -> PyResult<(Vec<u8>, Vec<process::FragmentStat>)> {
+                        let mut key: Option<[u8; 16]> = key;
+                        let mut buf: Vec<u8> = vec![0u8; len];
+                        let fragments: Vec<process::FragmentStat> =
+                            process::build(data.bytes(), key.as_ref(), strict, core_meta.as_ref(), &mut buf)?;
+                        wipe_key(&mut key);
+                        let classic_buf: Vec<u8> = defrag::defragment(&buf)?;
+                        Ok((classic_buf, fragments))
+                    },
+                ).await.map_err(join_err)??;
+                check_strict(&fragments, guarded)?;
+                let result: Py<PyBytes> = Python::attach(|py| PyBytes::new(py, &final_buf).unbind());
+                Ok(Some(result))
             }
             Output::Return => {
                 // allocate the result under a brief GIL attach, then build off-GIL
