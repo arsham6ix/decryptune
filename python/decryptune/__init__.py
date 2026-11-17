@@ -39,7 +39,7 @@ except ImportError as _imp_err:
         raise ImportError(f"staged extension {_lib} failed to load: {_load_err}") from _load_err
     sys.modules[f"{__name__}.decryptune"] = _native  # register like a real submodule import
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 __all__ = ["DecrypTune", "DecrypTuneError", "TuneMeta", "__version__"]
 
 
@@ -63,7 +63,7 @@ class DecrypTuneError(Exception):
 # all error messages are authored by the native core (error.rs) — this wrapper
 # relays [code] + message; anything outside the known code range (or without a
 # [N] prefix) is not a native error and propagates unchanged
-_NATIVE_CODES: frozenset[int] = frozenset(range(1, 15))  # 14 = CoverTooLarge is the last
+_NATIVE_CODES: frozenset[int] = frozenset(range(1, 16))  # 15 = ClassicUnsupported is the last (error.rs)
 
 
 def _to_err(exc: Exception) -> DecrypTuneError | None:
